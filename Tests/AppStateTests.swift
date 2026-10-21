@@ -823,7 +823,7 @@ final class AppStateTests: XCTestCase {
         XCTAssertNil(state.browseToURL)
     }
 
-    func testLogoutResetsState() {
+    func testLogoutResetsState() async {
         let state = AppState()
         state.ipnState = .running
         state.peers = [PeerNode(from: .init(ID: 1, StableID: "x", Key: nil, Name: "test.", ComputedName: nil, Hostinfo: nil, Addresses: [], Online: true, OS: nil, UserID: nil, KeyExpiry: nil, IsExitNode: nil, AllowedIPs: nil), isSelf: false, userProfile: nil)]
@@ -831,7 +831,7 @@ final class AppStateTests: XCTestCase {
         state.localAwgStatus = true
         state.awgPeersStatus["test"] = true
 
-        state.logout()
+        await state.logout()?.value
 
         XCTAssertEqual(state.ipnState, .needsLogin)
         XCTAssertTrue(state.peers.isEmpty)
@@ -840,6 +840,82 @@ final class AppStateTests: XCTestCase {
         XCTAssertNil(state.currentAwgConfig)
         XCTAssertFalse(state.localAwgStatus)
         XCTAssertTrue(state.awgPeersStatus.isEmpty)
+    }
+
+    func testLogoutOwnsTransitionUntilStopCompletes() async throws {
+        let state = AppState(vpnPermissionCapability: false)
+        state.ipnState = .running
+        state.currentAwgConfig = .init(JC: 3)
+        let originalPermissionMode = state.usesVPNPermission
+        var stopContinuation: CheckedContinuation<Void, Error>?
+        let logout = try XCTUnwrap(state.logout(stopTunnel: {
+            try await withCheckedThrowingContinuation { stopContinuation = $0 }
+        }))
+        XCTAssertTrue(state.isLoggingOut)
+        while stopContinuation == nil { await Task.yield() }
+
+        state.startLogin()
+        XCTAssertFalse(state.isLoggingIn)
+        state.setWantRunning(true)
+        XCTAssertNil(state.pendingWantRunning)
+        state.setUsesVPNPermission(!originalPermissionMode)
+        XCTAssertEqual(state.usesVPNPermission, originalPermissionMode)
+        XCTAssertNil(state.logout())
+        XCTAssertEqual(state.currentAwgConfig?.JC, 3)
+
+        stopContinuation?.resume()
+        await logout.value
+        XCTAssertFalse(state.isLoggingOut)
+        XCTAssertEqual(state.ipnState, .needsLogin)
+        XCTAssertNil(state.currentAwgConfig)
+    }
+
+    func testLogoutStopFailurePreservesSessionAndReleasesTransition() async throws {
+        let state = AppState()
+        state.ipnState = .running
+        state.currentAwgConfig = .init(JC: 3)
+        let logout = try XCTUnwrap(state.logout(stopTunnel: { throw VPNError.stopTimeout }))
+        await logout.value
+        XCTAssertFalse(state.isLoggingOut)
+        XCTAssertEqual(state.ipnState, .running)
+        XCTAssertEqual(state.currentAwgConfig?.JC, 3)
+        XCTAssertTrue(state.lastError?.contains("Could not finish logging out") == true)
+    }
+
+    func testCancelledLogoutPreservesSessionAndReleasesTransition() async throws {
+        let state = AppState()
+        state.ipnState = .running
+        state.currentAwgConfig = .init(JC: 3)
+        var stopStarted = false
+        let logout = try XCTUnwrap(state.logout(stopTunnel: {
+            stopStarted = true
+            try await Task.sleep(nanoseconds: 60_000_000_000)
+        }))
+        while !stopStarted { await Task.yield() }
+        logout.cancel()
+        await logout.value
+        XCTAssertFalse(state.isLoggingOut)
+        XCTAssertEqual(state.ipnState, .running)
+        XCTAssertEqual(state.currentAwgConfig?.JC, 3)
+        XCTAssertNotNil(state.lastError)
+    }
+
+    func testLogoutCanCancelLoginInProgress() async throws {
+        let state = AppState()
+        state.isLoggingIn = true
+        let logout = try XCTUnwrap(state.logout(stopTunnel: {}))
+        await logout.value
+        XCTAssertFalse(state.isLoggingIn)
+        XCTAssertFalse(state.isLoggingOut)
+        XCTAssertEqual(state.ipnState, .needsLogin)
+    }
+
+    func testLogoutDoesNotInterruptExistingConnectionTransition() {
+        let state = AppState()
+        state.pendingWantRunning = true
+        XCTAssertNil(state.logout())
+        XCTAssertFalse(state.isLoggingOut)
+        XCTAssertEqual(state.pendingWantRunning, true)
     }
 
     func testHandleNotifyInvalidJSON() {

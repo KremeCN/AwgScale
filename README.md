@@ -6,6 +6,15 @@ AwgScale is independent software — not affiliated with, sponsored by, or appro
 
 ---
 
+## Reliability changes (unreleased)
+
+The development build uses the verified 1.104.2 fork core, QUIC `10dfe69b6d4c`,
+uTLS `7effde6a93dc`, and WireGuard `v0.0.34`. It hardens backend readiness,
+request cancellation, tunnel teardown and Keychain state updates. See
+[the comparison and validation record](docs/ios-reliability-20261021.md).
+The official IPA reference exposes metadata and bridge names; its encrypted
+function bodies were not recovered and are not claimed as source parity.
+
 ## 1.104.1 preview
 
 [Download the 1.104.1 preview](https://github.com/LiuTangLei/AwgScale/releases/tag/v1.104.1).
@@ -81,10 +90,11 @@ xcodebuild build -project AwgScale.xcodeproj -scheme AwgScale \
 ```
 
 `build_go.sh` verifies the published dependencies before compiling:
-`github.com/LiuTangLei/tailscale v1.104.1`,
+`github.com/LiuTangLei/tailscale v1.104.2`,
 `github.com/LiuTangLei/wireguard-go v0.0.34`, and
-`github.com/LiuTangLei/quic-go v0.63.0-tailscale.1.0.20260929072415-cda3ed094749`.
-It uses Go 1.27.1 and matching gomobile/gobind tools. `GOWORK=off` prevents
+`github.com/LiuTangLei/quic-go v0.63.0-tailscale.1.0.20261021083103-10dfe69b6d4c`,
+and `github.com/LiuTangLei/utls v1.8.3-0.20261021023852-7effde6a93dc`.
+It uses Go 1.27.3 and matching gomobile/gobind tools. `GOWORK=off` prevents
 ambient local source replacements. Native AWG v2/v3 and QUIC remain supported.
 
 App-only UI can be developed in the Simulator. The system VPN tunnel requires a device with a valid Network Extension entitlement.

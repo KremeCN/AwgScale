@@ -2,74 +2,130 @@ import Foundation
 
 @MainActor
 final class AppLoginBackend {
+    struct Runtime {
+        var start: () throws -> Void
+        var stop: () -> Void
+        var callLocalAPI: (String, String, Data?, Int, Bool) async throws -> IPCResponse
+        var watchNotifications: (@escaping (Data) -> Void) -> NotificationHandle?
+        var stopNotifications: (NotificationHandle) -> Void
+
+        static var live: Runtime {
+            Runtime(
+                start: {
+                    let containerURL = sharedContainerURL ?? fallbackContainerURL()
+                    let dataDirURL = containerURL.appendingPathComponent("awgscale", isDirectory: true)
+                    let directFileRootURL = containerURL.appendingPathComponent("taildrop", isDirectory: true)
+                    try FileManager.default.createDirectory(at: dataDirURL, withIntermediateDirectories: true)
+                    try FileManager.default.createDirectory(at: directFileRootURL, withIntermediateDirectories: true)
+                    guard GoBridge.start(
+                        dataDir: dataDirURL.path,
+                        directFileRoot: directFileRootURL.path,
+                        hwAttestation: false,
+                        appLogin: true
+                    ) else {
+                        throw AppLoginBackendError.startFailed
+                    }
+                },
+                stop: { GoBridge.stopBackend() },
+                callLocalAPI: { method, endpoint, body, timeout, readBody in
+                    let response = try await Task.detached(priority: .userInitiated) {
+                        try await GoBridge.callLocalAPI(
+                            timeoutMillis: timeout,
+                            method: method,
+                            endpoint: endpoint,
+                            body: body,
+                            readBody: readBody
+                        )
+                    }.value
+                    return IPCResponse.success(statusCode: response.statusCode, body: response.body)
+                },
+                watchNotifications: { callback in
+                    GoBridge.watchNotifications(mask: NotifyWatchOpt.defaultMask, callback: callback)
+                },
+                stopNotifications: { GoBridge.stopNotifications($0) }
+            )
+        }
+    }
+
+    private let runtime: Runtime
     private var notifyHandle: NotificationHandle?
     private var running = false
+    private var generation: UInt64 = 0
+    private var startTask: Task<Void, Error>?
+
+    init(runtime: Runtime? = nil) {
+        self.runtime = runtime ?? .live
+    }
 
     var isRunning: Bool { running }
 
     func start(onNotify: @escaping (Data) -> Void) async throws {
+        if let startTask {
+            let attempt = generation
+            try await startTask.value
+            try requireCurrentAttempt(attempt)
+            return
+        }
         if running { return }
-
-        let containerURL = sharedContainerURL ?? fallbackContainerURL()
-
-        let dataDirURL = containerURL.appendingPathComponent("awgscale", isDirectory: true)
-        let directFileRootURL = containerURL.appendingPathComponent("taildrop", isDirectory: true)
-
-        try FileManager.default.createDirectory(at: dataDirURL, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: directFileRootURL, withIntermediateDirectories: true)
-
-        guard GoBridge.start(
-            dataDir: dataDirURL.path,
-            directFileRoot: directFileRootURL.path,
-            hwAttestation: false,
-            appLogin: true
-        ) else {
-            throw AppLoginBackendError.startFailed
-        }
-
-        running = true
-
-        do {
-            _ = try await callLocalAPI(method: "GET", endpoint: "/localapi/v0/status", timeout: 30000)
-        } catch {
-            stop()
-            throw error
-        }
-
-        guard let handle = GoBridge.watchNotifications(mask: NotifyWatchOpt.defaultMask, callback: { data in
-            Task { @MainActor in
-                onNotify(data)
+        generation &+= 1
+        let attempt = generation
+        let task = Task { @MainActor in
+            do {
+                try requireCurrentAttempt(attempt)
+                try runtime.start()
+                running = true
+                _ = try await callLocalAPI(method: "GET", endpoint: "/localapi/v0/status", timeout: 30000)
+                try requireCurrentAttempt(attempt)
+                guard let handle = runtime.watchNotifications({ [weak self] data in
+                    Task { @MainActor in
+                        guard let self, self.generation == attempt, self.running else { return }
+                        onNotify(data)
+                    }
+                }) else {
+                    throw AppLoginBackendError.notificationsFailed
+                }
+                notifyHandle = handle
+            } catch {
+                // An older start may finish after stop and a new start. Its
+                // completion must never stop or subscribe to that new backend.
+                if generation == attempt {
+                    stop()
+                }
+                throw error
             }
-        }) else {
-            stop()
-            throw AppLoginBackendError.notificationsFailed
         }
-        notifyHandle = handle
+        startTask = task
+        defer {
+            if generation == attempt {
+                startTask = nil
+            }
+        }
+        try await task.value
+        try requireCurrentAttempt(attempt)
+    }
+
+    private func requireCurrentAttempt(_ attempt: UInt64) throws {
+        guard generation == attempt, !Task.isCancelled else {
+            throw CancellationError()
+        }
     }
 
     func stop() {
+        generation &+= 1
+        startTask?.cancel()
+        startTask = nil
         if let handle = notifyHandle {
-            GoBridge.stopNotifications(handle)
+            runtime.stopNotifications(handle)
             notifyHandle = nil
         }
         if running {
-            GoBridge.stopBackend()
+            runtime.stop()
             running = false
         }
     }
 
     func callLocalAPI(method: String, endpoint: String, body: Data? = nil, timeout: Int = 30000, readBody: Bool = true) async throws -> IPCResponse {
-        let localResponse = try await Task.detached(priority: .userInitiated) {
-            try await GoBridge.callLocalAPI(
-                timeoutMillis: timeout,
-                method: method,
-                endpoint: endpoint,
-                body: body,
-                readBody: readBody
-            )
-        }.value
-
-        return IPCResponse.success(statusCode: localResponse.statusCode, body: localResponse.body)
+        try await runtime.callLocalAPI(method, endpoint, body, timeout, readBody)
     }
 
     func startLoginInteractive() async throws -> IPCResponse {

@@ -46,6 +46,7 @@ type App struct {
 	directFileRoot string
 	appCtx         AppContext
 	appLogin       bool
+	ctx            context.Context
 	cancel         context.CancelFunc
 	stopOnce       sync.Once
 	mu             sync.Mutex
@@ -121,6 +122,7 @@ func newApp(dataDir, directFileRoot string, hwAttestationPref bool, appLogin boo
 		directFileRoot: directFileRoot,
 		appCtx:         appCtx,
 		appLogin:       appLogin,
+		ctx:            ctx,
 		cancel:         cancel,
 		ready:          make(chan struct{}),
 		sshSessions:    make(map[string]*inAppSSHSession),
@@ -167,19 +169,20 @@ func (a *App) runBackend(ctx context.Context, hardwareAttestation bool) error {
 	if err != nil {
 		return err
 	}
-	a.logIDPublicAtomic.Store(&b.logIDPublic)
-	a.mu.Lock()
-	if a.stopped || ctx.Err() != nil {
-		a.mu.Unlock()
+	// Keep ownership local until Start and handler initialization have both
+	// completed. Stop must not shut down a backend concurrently with its Start.
+	if ctx.Err() != nil {
 		a.closeBackendState(b)
-		return context.Canceled
+		return ctx.Err()
 	}
-	a.backend = b.backend
-	a.backendState = b // prevent GC of backend struct while App is alive
-	a.mu.Unlock()
 	if hardwareAttestation {
-		a.backend.SetHardwareAttested()
+		b.backend.SetHardwareAttested()
 	}
+	if err := b.backend.Start(ipn.Options{}); err != nil {
+		a.closeBackendState(b)
+		return fmt.Errorf("start LocalBackend: %w", err)
+	}
+	a.logIDPublicAtomic.Store(&b.logIDPublic)
 
 	hc := localapi.HandlerConfig{
 		Actor:    ipnauth.Self,
@@ -191,10 +194,32 @@ func (a *App) runBackend(ctx context.Context, hardwareAttestation bool) error {
 	h := localapi.NewHandler(hc)
 	h.PermitRead = true
 	h.PermitWrite = true
-	a.localAPIHandler = a.withInAppToolsHandler(h, b)
+	if !a.publishBackend(b, a.withInAppToolsHandler(h, b)) {
+		a.closeBackendState(b)
+		return context.Canceled
+	}
 
 	<-ctx.Done()
 	return ctx.Err()
+}
+
+// publishBackend transfers shutdown ownership to Stop and wakes readiness
+// waiters only after every object they can access has been initialized.
+func (a *App) publishBackend(b *backend, handler http.Handler) bool {
+	a.mu.Lock()
+	if a.stopped {
+		a.mu.Unlock()
+		return false
+	}
+	a.backend = b.backend
+	a.backendState = b
+	a.localAPIHandler = handler
+	if b.tunDev != nil {
+		b.tunDev.SetPacketCallback(a.packetCallback)
+	}
+	a.mu.Unlock()
+	a.markReady(nil)
+	return true
 }
 
 func (a *App) newBackend(dataDir string, appCtx AppContext, store *stateStore) (*backend, error) {
@@ -290,6 +315,7 @@ func (a *App) newBackend(dataDir string, appCtx AppContext, store *stateStore) (
 		TransportManaged:  transportManaged,
 	})
 	if err != nil {
+		a.closeBackendState(b)
 		return nil, fmt.Errorf("runBackend: NewUserspaceEngine: %v", err)
 	}
 	b.engine = engine
@@ -361,15 +387,6 @@ func (a *App) newBackend(dataDir string, appCtx AppContext, store *stateStore) (
 		lb.SetLogFlusher(b.logger.StartFlush)
 	}
 	b.sys = sys
-
-	go func() {
-		if err := lb.Start(ipn.Options{}); err != nil {
-			a.markReady(err)
-			log.Printf("Failed to start LocalBackend: %s", err)
-			panic(err)
-		}
-		a.markReady(nil)
-	}()
 
 	return b, nil
 }
@@ -632,6 +649,7 @@ func (a *App) Stop() {
 		a.stopped = true
 		a.backend = nil
 		a.backendState = nil
+		a.localAPIHandler = nil
 		a.mu.Unlock()
 
 		if cancel != nil {
@@ -684,14 +702,25 @@ func (a *App) markReady(err error) {
 }
 
 func (a *App) waitReady() error {
+	return a.waitReadyContext(context.Background())
+}
+
+func (a *App) waitReadyContext(ctx context.Context) error {
 	a.mu.Lock()
 	ready := a.ready
 	a.mu.Unlock()
 	if ready == nil {
 		return os.ErrNotExist
 	}
-	<-ready
+	select {
+	case <-ready:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.stopped {
+		return context.Canceled
+	}
 	return a.readyErr
 }

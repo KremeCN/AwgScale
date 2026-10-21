@@ -126,19 +126,32 @@ func (app *App) callLocalAPI(timeoutMillis int, method, endpoint string, header 
 		}
 	}()
 
-	if err := app.waitReady(); err != nil {
+	parent := app.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, time.Duration(timeoutMillis)*time.Millisecond)
+	handlerOwnsRequest := false
+	defer func() {
+		if !handlerOwnsRequest {
+			cancel()
+			if body != nil {
+				_ = body.Close()
+			}
+		}
+	}()
+	if err := app.waitReadyContext(ctx); err != nil {
 		return nil, err
 	}
-	if app.localAPIHandler == nil {
-		return nil, fmt.Errorf("localapi handler not ready")
+	app.mu.Lock()
+	handler := app.localAPIHandler
+	stopped := app.stopped
+	app.mu.Unlock()
+	if stopped {
+		return nil, context.Canceled
 	}
-	app.refreshUsableDERPMapForLocalAPI(endpoint)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(uint64(timeoutMillis)*uint64(time.Millisecond)))
-	defer cancel()
-
-	if body != nil {
-		defer body.Close()
+	if handler == nil {
+		return nil, fmt.Errorf("localapi handler not ready")
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
@@ -151,6 +164,12 @@ func (app *App) callLocalAPI(timeoutMillis int, method, endpoint string, header 
 	pipeReader, pipeWriter := net.Pipe()
 	pipeReader.SetDeadline(deadline)
 	pipeWriter.SetDeadline(deadline)
+	stopCancel := context.AfterFunc(ctx, func() {
+		// Stop also interrupts a blocked response read/write, without waiting
+		// for the original request deadline.
+		_ = pipeReader.SetDeadline(time.Now())
+		_ = pipeWriter.SetDeadline(time.Now())
+	})
 
 	resp := &Response{
 		headers:          http.Header{},
@@ -160,7 +179,20 @@ func (app *App) callLocalAPI(timeoutMillis int, method, endpoint string, header 
 		startWritingBody: make(chan interface{}),
 	}
 
+	handlerOwnsRequest = true
+	requestReturned := make(chan struct{})
+	defer close(requestReturned)
 	go func() {
+		defer func() {
+			// An empty response can finish before the caller receives its
+			// headers. Do not make successful completion look like cancellation.
+			<-requestReturned
+			cancel()
+		}()
+		defer stopCancel()
+		if body != nil {
+			defer body.Close()
+		}
 		defer func() {
 			if p := recover(); p != nil {
 				log.Printf("panic in CallLocalAPI.ServeHTTP %s: %s", p, debug.Stack())
@@ -176,15 +208,24 @@ func (app *App) callLocalAPI(timeoutMillis int, method, endpoint string, header 
 		// map might otherwise hold EOF behind one or more DNS lookups.
 		defer app.refreshUsableDERPMapForLocalAPI(endpoint + "-complete")
 		defer pipeWriter.Close()
-		app.localAPIHandler.ServeHTTP(resp, req)
+		app.refreshUsableDERPMapForLocalAPI(endpoint)
+		if ctx.Err() != nil {
+			return
+		}
+		handler.ServeHTTP(resp, req)
 		resp.Flush()
 	}()
 
 	select {
 	case <-resp.startWritingBody:
+		if err := ctx.Err(); err != nil {
+			_ = pipeReader.Close()
+			return nil, fmt.Errorf("localapi %s: %w", endpoint, err)
+		}
 		return resp, nil
 	case <-ctx.Done():
-		return nil, fmt.Errorf("timeout for %s", endpoint)
+		_ = pipeReader.Close()
+		return nil, fmt.Errorf("localapi %s: %w", endpoint, ctx.Err())
 	}
 }
 

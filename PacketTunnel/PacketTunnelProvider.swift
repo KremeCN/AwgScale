@@ -810,7 +810,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         tunnelSettingsQueue.async { [weak self] in
             guard let self = self else { return }
             guard !self.tunnelStopping else {
-                completion?(nil)
+                // The start completion reads lifecycle state synchronously on
+                // this queue. Invoke it outside the queue to avoid self-deadlock.
+                DispatchQueue.main.async { completion?(nil) }
                 return
             }
             let request = TunnelSettingsRequest(settings: settings, hasDefaultRoute: hasDefaultRoute, completion: completion)
@@ -844,8 +846,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     if request.hasDefaultRoute != nil && self?.isTunnelStopping() != true {
                         self?.publishLastError("setTunnelNetworkSettings failed: \(error.localizedDescription)")
                     }
-                } else if let hasDefaultRoute = request.hasDefaultRoute {
-                    self?.publishTunnelDefaultRoute(hasDefaultRoute)
+                } else if let hasDefaultRoute = request.hasDefaultRoute, let self {
+                    // Serialize the check and publication against stopTunnel.
+                    // An already-issued settings request may finish after stop.
+                    self.tunnelSettingsQueue.sync {
+                        if !self.tunnelStopping {
+                            self.publishTunnelDefaultRoute(hasDefaultRoute)
+                        }
+                    }
                 }
                 request.completion?(completionError)
                 self?.finishTunnelSettingsUpdate()

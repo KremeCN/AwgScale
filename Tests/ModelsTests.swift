@@ -5,7 +5,7 @@ final class ModelsTests: XCTestCase {
 
     @MainActor
     func testEmbeddedCoreVersionMatchesRelease() {
-        XCTAssertEqual(GoBridge.coreVersion, "1.104.1-t411ee6685")
+        XCTAssertEqual(GoBridge.coreVersion, "1.104.2-td7efe75c7")
         XCTAssertEqual(AppState().tailscaleAwgVersion, GoBridge.coreVersion)
     }
 

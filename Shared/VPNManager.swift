@@ -181,22 +181,16 @@ class VPNManager: ObservableObject {
         }
 
         manager.connection.stopVPNTunnel()
-        await waitForTunnelStopped()
+        try await waitUntilTunnelStopped()
         guard manager.isEnabled else { return }
+        try Task.checkCancellation()
         try manager.connection.startVPNTunnel()
         updateStatusFromConnection()
     }
 
-    private func waitForTunnelStopped() async {
-        for _ in 0..<30 {
-            switch updateStatusFromConnection() {
-            case .connected, .connecting, .reasserting, .disconnecting:
-                try? await Task.sleep(nanoseconds: 200_000_000)
-            default:
-                return
-            }
-        }
-        updateStatusFromConnection()
+    /// A completed stop is required before another owner may open backend state.
+    func waitUntilTunnelStopped(timeout: TimeInterval = 6) async throws {
+        try await waitForVPNStopped(timeout: timeout) { self.updateStatusFromConnection() }
     }
 
     /// Save VPN configuration. This will trigger the system VPN permission dialog on first use.
@@ -241,6 +235,10 @@ class VPNManager: ObservableObject {
             return
         }
 
+        if updateStatusFromConnection() == .disconnecting {
+            try await waitUntilTunnelStopped()
+        }
+        try Task.checkCancellation()
         switch updateStatusFromConnection() {
         case .connected:
             return
@@ -257,9 +255,9 @@ class VPNManager: ObservableObject {
         updateStatusFromConnection()
     }
 
-    func resetAfterPermissionModeChange() async {
+    func resetAfterPermissionModeChange() async throws {
         manager?.connection.stopVPNTunnel()
-        await waitForTunnelStopped()
+        try await waitUntilTunnelStopped()
         manager = nil
         needsConfigurationInstall = true
         await loadManager()
@@ -444,6 +442,7 @@ enum VPNError: Error, LocalizedError {
     case noManager
     case backendNotReady(String)
     case ipcTimeout
+    case stopTimeout
     case sharedContainerUnavailable
 
     var errorDescription: String? {
@@ -453,7 +452,27 @@ enum VPNError: Error, LocalizedError {
         case .noManager: return "VPN manager not configured"
         case .backendNotReady(let message): return "VPN backend did not become ready: \(message)"
         case .ipcTimeout: return "Timed out waiting for Packet Tunnel IPC response"
+        case .stopTimeout: return "The previous VPN tunnel has not stopped yet. Please try again."
         case .sharedContainerUnavailable: return "Shared app container is unavailable"
         }
+    }
+}
+
+/// Poll the real connection state with a monotonic deadline. Cancellation and a
+/// slow teardown must never be interpreted as permission to start a new owner.
+@MainActor
+func waitForVPNStopped(
+    timeout: TimeInterval = 6,
+    pollIntervalNanoseconds: UInt64 = 200_000_000,
+    status: () -> NEVPNStatus
+) async throws {
+    let deadline = ProcessInfo.processInfo.systemUptime + timeout
+    while true {
+        try Task.checkCancellation()
+        if status().isFullyStopped { return }
+        guard ProcessInfo.processInfo.systemUptime < deadline else {
+            throw VPNError.stopTimeout
+        }
+        try await Task.sleep(nanoseconds: pollIntervalNanoseconds)
     }
 }

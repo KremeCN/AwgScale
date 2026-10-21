@@ -115,102 +115,23 @@ class GoAppContext: NSObject, LibtailscaleAppContextProtocol {
 
     // MARK: - Encrypted Preferences (Keychain)
 
+    private let preferences = KeychainPreferences(
+        groups: GoAppContext.keychainGroupCandidates(), fallback: sharedDefaults ?? UserDefaults.standard
+    )
+
     func encrypt(toPref key: String?, value: String?) throws {
-        guard let key = key, let value = value else { return }
-        let data = Data(value.utf8)
-        var lastStatus: OSStatus = errSecSuccess
-        var sawMissingEntitlement = false
-
-        for keychainGroup in keychainGroups {
-            // Delete existing item first to avoid errSecDuplicateItem
-            let deleteQuery = GoAppContext.withAccessGroup(keychainGroup, query: [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrAccount as String: key,
-            ])
-            let delStatus = SecItemDelete(deleteQuery as CFDictionary)
-            if delStatus != errSecSuccess && delStatus != errSecItemNotFound {
-                if delStatus == errSecMissingEntitlement {
-                    sawMissingEntitlement = true
-                }
-                lastStatus = delStatus
-                continue
-            }
-
-            let addQuery = GoAppContext.withAccessGroup(keychainGroup, query: [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrAccount as String: key,
-                kSecValueData as String: data,
-                kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
-            ])
-
-            let status = SecItemAdd(addQuery as CFDictionary, nil)
-            if status == errSecSuccess {
-                // The secret now lives in the shared Keychain group, which both
-                // the app and the network extension access directly. Do NOT mirror
-                // it into App Group UserDefaults (unencrypted on disk); purge any
-                // legacy plaintext copy. The UserDefaults fallback below is only
-                // used when the Keychain is unavailable (a build without the
-                // keychain-access-groups entitlement).
-                fallbackPreferences.removeObject(forKey: key)
-                return
-            }
-            if status == errSecMissingEntitlement {
-                sawMissingEntitlement = true
-            }
-            lastStatus = status
-        }
-
-        if sawMissingEntitlement {
-            fallbackPreferences.set(value, forKey: key)
-            return
-        }
-
-        throw NSError(domain: NSOSStatusErrorDomain, code: Int(lastStatus))
+        guard let key, let value else { return }
+        try preferences.write(key, value: value)
     }
 
     func decrypt(fromPref key: String?, error: NSErrorPointer) -> String {
-        guard let key = key else { return "" }
-
-        var lastStatus: OSStatus = errSecItemNotFound
-        var sawItemNotFound = false
-        var sawMissingEntitlement = false
-
-        for keychainGroup in keychainGroups {
-            let query = GoAppContext.withAccessGroup(keychainGroup, query: [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrAccount as String: key,
-                kSecReturnData as String: true,
-                kSecMatchLimit as String: kSecMatchLimitOne,
-            ])
-
-            var result: AnyObject?
-            let status = SecItemCopyMatching(query as CFDictionary, &result)
-            if status == errSecSuccess, let data = result as? Data {
-                let value = String(data: data, encoding: .utf8) ?? ""
-                // Keychain is the source of truth; purge any legacy plaintext
-                // mirror so secrets are not left unencrypted in App Group storage.
-                if fallbackPreferences.object(forKey: key) != nil {
-                    fallbackPreferences.removeObject(forKey: key)
-                }
-                return value
-            }
-            if status == errSecItemNotFound {
-                sawItemNotFound = true
-            } else if status == errSecMissingEntitlement {
-                sawMissingEntitlement = true
-            } else {
-                lastStatus = status
-            }
+        guard let key else { return "" }
+        do {
+            return try preferences.read(key)
+        } catch let failure as NSError {
+            error?.pointee = failure
+            return ""
         }
-
-        if let fallbackValue = fallbackPreferences.string(forKey: key) {
-            return fallbackValue
-        }
-
-        if !sawItemNotFound && !sawMissingEntitlement {
-            error?.pointee = NSError(domain: NSOSStatusErrorDomain, code: Int(lastStatus))
-        }
-        return ""
     }
 
     func getStateStoreKeysJSON() -> String {

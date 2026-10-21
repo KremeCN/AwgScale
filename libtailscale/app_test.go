@@ -3,8 +3,10 @@ package libtailscale
 import (
 	"context"
 	"errors"
+	"net/http"
 	"net/netip"
 	"os"
+	"sync"
 	"testing"
 
 	wgtun "github.com/LiuTangLei/wireguard-go/tun"
@@ -270,6 +272,70 @@ func TestAppWaitReadyZeroValue(t *testing.T) {
 	a := &App{}
 	if err := a.waitReady(); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("zero-value waitReady = %v, want os.ErrNotExist", err)
+	}
+}
+
+func TestPublishBackendMakesHandlerReady(t *testing.T) {
+	a := &App{ready: make(chan struct{})}
+	b := &backend{tunDev: newPendingTUN()}
+	defer a.Stop()
+	// The callback may be registered while backend creation is in progress.
+	cb := &testPacketCallback{}
+	a.SetPacketCallback(cb)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ready"))
+	})
+	if !a.publishBackend(b, handler) {
+		t.Fatal("backend was not published")
+	}
+	if err := a.waitReady(); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := a.callLocalAPI(1000, "GET", "/test", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := resp.BodyBytes()
+	if err != nil || string(got) != "ready" {
+		t.Fatalf("ready response = %q, %v", got, err)
+	}
+	if _, err := b.tunDev.Write([][]byte{{0x45}}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if string(cb.packet) != string([]byte{0x45}) {
+		t.Fatal("callback registered during startup was lost")
+	}
+}
+
+func TestPublishBackendRacingStop(t *testing.T) {
+	for range 100 {
+		a := &App{ready: make(chan struct{})}
+		b := &backend{tunDev: newPendingTUN()}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if !a.publishBackend(b, http.NotFoundHandler()) {
+				a.closeBackendState(b)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			a.Stop()
+		}()
+		wg.Wait()
+		if err := a.waitReady(); !errors.Is(err, context.Canceled) {
+			t.Fatalf("ready after Stop = %v", err)
+		}
+		if !b.tunDev.closedNow() {
+			t.Fatal("stopped startup leaked its TUN")
+		}
+		a.mu.Lock()
+		published := a.backendState != nil || a.localAPIHandler != nil
+		a.mu.Unlock()
+		if published {
+			t.Fatal("stopped backend was published")
+		}
 	}
 }
 

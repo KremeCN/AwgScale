@@ -19,10 +19,10 @@ cd "$SCRIPT_DIR"
 # Release builds must use the versioned forks in go.mod, never an ambient
 # parent workspace that happens to contain unreleased protocol changes.
 export GOWORK=off
-# The published core requires Go >= 1.27.1 and is validated against 1.27.1.
+# The published core requires Go >= 1.27.3 and is validated against 1.27.3.
 # Pin the toolchain so gomobile/gobind and every `go` invocation below build
 # with the same compiler used to qualify the release.
-export GOTOOLCHAIN=go1.27.1
+export GOTOOLCHAIN=go1.27.3
 # Keep caller-provided build flags, but make dependency resolution immutable.
 # Appending makes this the effective -mod value if GOFLAGS already contains one.
 export GOFLAGS="${GOFLAGS:+$GOFLAGS }-mod=readonly"
@@ -63,9 +63,12 @@ WIREGUARD_VERSION="$(go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{
 QUICGO_SOURCE="$(go list -m -f '{{if .Replace}}{{.Replace.Path}}{{else}}{{.Path}}{{end}}' github.com/quic-go/quic-go)"
 QUICGO_VERSION="$(go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' github.com/quic-go/quic-go)"
 
+UTLS_SOURCE="$(go list -m -f '{{if .Replace}}{{.Replace.Path}}{{else}}{{.Path}}{{end}}' github.com/refraction-networking/utls)"
+UTLS_VERSION="$(go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' github.com/refraction-networking/utls)"
+
 if [[ "$TAILSCALE_SOURCE" != "github.com/LiuTangLei/tailscale" ||
-      "$TAILSCALE_VERSION" != "v1.104.1" ]]; then
-    echo "error: expected github.com/LiuTangLei/tailscale v1.104.1, got $TAILSCALE_SOURCE $TAILSCALE_VERSION" >&2
+      "$TAILSCALE_VERSION" != "v1.104.2" ]]; then
+    echo "error: expected github.com/LiuTangLei/tailscale v1.104.2, got $TAILSCALE_SOURCE $TAILSCALE_VERSION" >&2
     exit 1
 fi
 if [[ "$WIREGUARD_SOURCE" != "github.com/LiuTangLei/wireguard-go" ||
@@ -74,13 +77,19 @@ if [[ "$WIREGUARD_SOURCE" != "github.com/LiuTangLei/wireguard-go" ||
     exit 1
 fi
 if [[ "$QUICGO_SOURCE" != "github.com/LiuTangLei/quic-go" ||
-      "$QUICGO_VERSION" != "v0.63.0-tailscale.1.0.20260929072415-cda3ed094749" ]]; then
-    echo "error: expected github.com/quic-go/quic-go => github.com/LiuTangLei/quic-go v0.63.0-tailscale.1.0.20260929072415-cda3ed094749, got $QUICGO_SOURCE $QUICGO_VERSION" >&2
+      "$QUICGO_VERSION" != "v0.63.0-tailscale.1.0.20261021083103-10dfe69b6d4c" ]]; then
+    echo "error: expected github.com/quic-go/quic-go => github.com/LiuTangLei/quic-go v0.63.0-tailscale.1.0.20261021083103-10dfe69b6d4c, got $QUICGO_SOURCE $QUICGO_VERSION" >&2
+    exit 1
+fi
+if [[ "$UTLS_SOURCE" != "github.com/LiuTangLei/utls" ||
+      "$UTLS_VERSION" != "v1.8.3-0.20261021023852-7effde6a93dc" ]]; then
+    echo "error: expected github.com/LiuTangLei/utls v1.8.3-0.20261021023852-7effde6a93dc, got $UTLS_SOURCE $UTLS_VERSION" >&2
     exit 1
 fi
 echo "Using $TAILSCALE_SOURCE $TAILSCALE_VERSION"
 echo "Using $WIREGUARD_SOURCE $WIREGUARD_VERSION"
 echo "Using $QUICGO_SOURCE $QUICGO_VERSION (github.com/quic-go/quic-go)"
+echo "Using $UTLS_SOURCE $UTLS_VERSION"
 
 MOBILE_VERSION="$(go list -m -f '{{.Version}}' golang.org/x/mobile)"
 # Other platform builds can require another x/mobile version concurrently.
@@ -110,7 +119,7 @@ gomobile bind \
     -target "$TARGET_FLAG" \
     -o "$OUTPUT" \
     -iosversion 15.0 \
-    -ldflags="-s -w -X tailscale.com/version.shortStamp=1.104.1 -X tailscale.com/version.longStamp=1.104.1-t411ee6685 -X tailscale.com/version.gitCommitStamp=411ee6685253069b5a3b496ab14c98e5b2f82afb" \
+    -ldflags="-s -w -X tailscale.com/version.shortStamp=1.104.2 -X tailscale.com/version.longStamp=1.104.2-td7efe75c7 -X tailscale.com/version.gitCommitStamp=d7efe75c7cce10651036bda98145e550ce0986ff" \
     ./libtailscale
 
 # Some gomobile/Xcode combinations emit framework Info.plist files with

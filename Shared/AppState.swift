@@ -274,6 +274,7 @@ class AppState: ObservableObject {
     @Published var health: HealthState?
     @Published var lastError: String?
     @Published var isLoggingIn: Bool = false
+    @Published private(set) var isLoggingOut: Bool = false
     @Published private(set) var canUseVPNPermission: Bool
     @Published var usesVPNPermission: Bool
     @Published var isSwitchingNetworkMode: Bool = false
@@ -359,6 +360,8 @@ class AppState: ObservableObject {
     private let loginBackend = AppLoginBackend()
     private var isCompletingAppLogin = false
     private var loginStartTask: Task<Void, Never>?
+    private var loginCompletionTask: Task<Void, Never>?
+    private var logoutTask: Task<Void, Never>?
     private var loginCompletionPollTask: Task<Void, Never>?
     private var activeLoginAttemptID: UUID?
     private var activeLoginControlServerURL: String?
@@ -450,6 +453,10 @@ class AppState: ObservableObject {
     }
 
     func setUsesVPNPermission(_ enabled: Bool) {
+        guard !isLoggingOut else {
+            lastError = "Wait for logout to finish before changing network mode."
+            return
+        }
         guard usesVPNPermission != enabled else { return }
         guard !isAwgOperationInProgress else {
             lastError = "Wait for the current AWG configuration change to finish."
@@ -486,7 +493,6 @@ class AppState: ObservableObject {
     }
 
     private func resetNetworksForPermissionModeChange(from previousMode: Bool, to enabled: Bool) async {
-        _ = previousMode
         let preservedAwgConfig = currentAwgConfig ?? prefs?.AmneziaWG
         defer {
             isSwitchingNetworkMode = false
@@ -518,8 +524,15 @@ class AppState: ObservableObject {
                 await vpn.prepareToDisconnect()
             }
             vpn.disconnect()
-            await waitForVPNStopped(vpn)
-            await vpn.resetAfterPermissionModeChange()
+            do {
+                try await vpn.resetAfterPermissionModeChange()
+            } catch {
+                usesVPNPermission = previousMode
+                UserDefaults.standard.set(previousMode, forKey: vpnPermissionEnabledKey)
+                persistSharedVPNPermissionMode(previousMode)
+                lastError = error.localizedDescription
+                return
+            }
         }
 
         updateCachedPrefs(wantRunning: false)
@@ -549,7 +562,7 @@ class AppState: ObservableObject {
     }
 
     private var isBackendTransitionInProgress: Bool {
-        pendingWantRunning != nil || awgSyncInProgress != nil || isAwgOperationInProgress ||
+        isLoggingOut || pendingWantRunning != nil || awgSyncInProgress != nil || isAwgOperationInProgress ||
             isUpdatingExitNode || isSwitchingNetworkMode || profileBackendLeaseCount > 0 ||
             isResumingAppBackend
     }
@@ -1211,6 +1224,10 @@ class AppState: ObservableObject {
     /// Login runs a temporary in-app Go backend so the browser auth flow can
     /// complete before the user chooses to turn AwgScale on.
     func startLogin(controlURL: String? = nil) {
+        guard !isLoggingOut else {
+            lastError = "Wait for logout to finish before signing in."
+            return
+        }
         guard !isLoggingIn else { return }
         guard !shouldProtectExistingSessionFromLoginStart else {
             lastError = "Already signed in. Disconnect or log out before starting a new login."
@@ -1301,6 +1318,9 @@ class AppState: ObservableObject {
     }
 
     private func invalidateActiveLoginAttempt() {
+        loginCompletionTask?.cancel()
+        loginCompletionTask = nil
+        isCompletingAppLogin = false
         loginStartTask?.cancel()
         loginStartTask = nil
         activeLoginAttemptID = nil
@@ -1376,6 +1396,7 @@ class AppState: ObservableObject {
     }
 
     private func finishAppLogin() {
+        guard !isLoggingOut else { return }
         guard loginBackend.isRunning else {
             invalidateActiveLoginAttempt()
             fetchCurrentProfile()
@@ -1386,8 +1407,15 @@ class AppState: ObservableObject {
         loginCompletionPollTask?.cancel()
         loginCompletionPollTask = nil
         isCompletingAppLogin = true
-        Task {
+        loginCompletionTask = Task {
+            defer {
+                if !Task.isCancelled {
+                    isCompletingAppLogin = false
+                    loginCompletionTask = nil
+                }
+            }
             let backendState = await loginBackendState()
+            guard !Task.isCancelled else { return }
             if backendState == .needsMachineAuth && canShowMachineAuthDuringLogin {
                 showMachineAuthPending()
                 isCompletingAppLogin = false
@@ -1396,10 +1424,12 @@ class AppState: ObservableObject {
             }
 
             await fetchCurrentProfileFromLoginBackend()
+            guard !Task.isCancelled else { return }
             var finalBackendState = backendState
             if finalBackendState == nil {
                 finalBackendState = await loginBackendState()
             }
+            guard !Task.isCancelled else { return }
             if let finalBackendState = finalBackendState {
                 ipnState = finalBackendState
             }
@@ -1765,43 +1795,72 @@ class AppState: ObservableObject {
         return false
     }
 
-    private func waitForVPNStopped(_ vpn: VPNManager) async {
-        for _ in 0..<25 {
-            let status = vpn.updateStatusFromConnection()
-            if status != .connected && status != .connecting && status != .reasserting && status != .disconnecting {
-                return
-            }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
+    private func waitForVPNStopped(_ vpn: VPNManager) async throws {
+        try await vpn.waitUntilTunnelStopped()
     }
 
-    /// Log out and clear all state.
-    func logout() {
+    /// Log out and clear state only after the previous tunnel owner has stopped.
+    @discardableResult
+    func logout() -> Task<Void, Never>? {
+        logout(stopTunnel: { [weak self] in
+            guard let self else { throw CancellationError() }
+            if let vpn = self.vpnManager {
+                // Logout can fail when the backend is already shutting down.
+                // Stopping the system tunnel is still mandatory in that case.
+                do {
+                    _ = try await LocalAPIClient.vpn(vpn).logout()
+                } catch {
+                    NSLog("LocalAPI logout failed; stopping the tunnel: \(error)")
+                }
+                vpn.disconnect()
+                try await self.waitForVPNStopped(vpn)
+            }
+        })
+    }
+
+    /// Keep ownership of the state transition across the asynchronous stop.
+    /// The stop action is injectable so tests can hold/fail the real boundary.
+    @discardableResult
+    func logout(stopTunnel: @escaping @MainActor () async throws -> Void) -> Task<Void, Never>? {
         guard !isAwgOperationInProgress else {
             lastError = "Wait for the current AWG configuration change to finish before logging out."
-            return
+            return nil
         }
         guard profileBackendLeaseCount == 0 else {
             lastError = "Wait for profile management to finish before logging out."
-            return
+            return nil
         }
+        guard !isBackendTransitionInProgress else {
+            lastError = "Wait for the current connection change to finish before logging out."
+            return nil
+        }
+        isLoggingOut = true
+        invalidateActiveLoginAttempt()
+        isLoggingIn = false
         loginCompletionPollTask?.cancel()
         loginCompletionPollTask = nil
-        clearInMemorySessionState()
-        clearSharedLoginState()
         loginBackend.stop()
 
-        Task {
-            if let vpn = vpnManager {
-                _ = try? await LocalAPIClient.vpn(vpn).logout()
-                vpn.disconnect()
-                await waitForVPNStopped(vpn)
+        let task = Task {
+            defer {
+                isLoggingOut = false
+                logoutTask = nil
+            }
+            do {
+                try Task.checkCancellation()
+                try await stopTunnel()
+                try Task.checkCancellation()
+            } catch {
+                lastError = "Could not finish logging out: \(error.localizedDescription)"
+                return
             }
 
             clearSharedLoginState()
             clearPersistedGoState()
             clearInMemorySessionState()
         }
+        logoutTask = task
+        return task
     }
 
     func cancelLogin() {
@@ -1810,6 +1869,10 @@ class AppState: ObservableObject {
 
     /// Toggle VPN on/off via prefs edit.
     func setWantRunning(_ wantRunning: Bool) {
+        guard !isLoggingOut else {
+            lastError = "Wait for logout to finish before changing the connection."
+            return
+        }
         guard !isAwgOperationInProgress else {
             lastError = "Wait for the current AWG configuration change to finish."
             return
@@ -1854,7 +1917,7 @@ class AppState: ObservableObject {
                     vpn.disconnect()
                     loginBackend.stop()
                     ipnState = .stopped
-                    await waitForVPNStopped(vpn)
+                    try await waitForVPNStopped(vpn)
                     sharedDefaults?.removeObject(forKey: IPCConstants.keyLastError)
                     lastError = nil
                     return
@@ -2014,8 +2077,8 @@ class AppState: ObservableObject {
             guard shouldRetryVPNStartAfterFailure(error) else { throw error }
             NSLog("Retrying VPN start after recoverable first-start failure: \(error)")
             vpn.disconnect()
-            await waitForVPNStopped(vpn)
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            try await waitForVPNStopped(vpn)
+            try await Task.sleep(nanoseconds: 1_000_000_000)
             sharedDefaults?.removeObject(forKey: IPCConstants.keyLastError)
             try await connectVPNAndSetWantRunning(vpn, requireNetMap: requireNetMap)
         }
@@ -2023,7 +2086,12 @@ class AppState: ObservableObject {
 
     private func cleanupVPNStartFailure(_ vpn: VPNManager, error: Error) async {
         vpn.disconnect()
-        await waitForVPNStopped(vpn)
+        do {
+            try await waitForVPNStopped(vpn)
+        } catch {
+            lastError = error.localizedDescription
+            return
+        }
         if shouldClearSessionAfterVPNStartFailure(error) {
             clearBackendSnapshotState()
             ipnState = .needsLogin
@@ -2257,7 +2325,9 @@ class AppState: ObservableObject {
 
     private func fetchCurrentProfileFromLoginBackend() async {
         do {
-            currentProfile = try await LocalAPIClient.login(loginBackend).currentProfile()
+            let profile = try await LocalAPIClient.login(loginBackend).currentProfile()
+            try Task.checkCancellation()
+            currentProfile = profile
         } catch {
             // Profile fetch is best-effort; login state has already been saved by the backend.
         }
