@@ -6,18 +6,15 @@ AwgScale is independent software — not affiliated with, sponsored by, or appro
 
 ---
 
-## Reliability changes (unreleased)
+## 1.104.2 preview
 
-The development build uses the verified 1.104.2 fork core, QUIC `10dfe69b6d4c`,
-uTLS `7effde6a93dc`, and WireGuard `v0.0.34`. It hardens backend readiness,
-request cancellation, tunnel teardown and Keychain state updates. See
+[Download the 1.104.2 preview](https://github.com/LiuTangLei/AwgScale/releases/tag/v1.104.2).
+
+Uses the verified 1.104.2 fork core, QUIC `10dfe69b6d4c`, uTLS `7effde6a93dc`,
+and WireGuard `v0.0.34`. Hardens backend startup, request timeouts, logout,
+Keychain updates and Share Sheet cancellation. See
 [the comparison and validation record](docs/ios-reliability-20261021.md).
-The official IPA reference exposes metadata and bridge names; its encrypted
-function bodies were not recovered and are not claimed as source parity.
 
-## 1.104.1 preview
-
-[Download the 1.104.1 preview](https://github.com/LiuTangLei/AwgScale/releases/tag/v1.104.1).
 The Settings screen has one **QUIC** choice; HTTP/3 is its built-in carrier, not
 a separate selection. QUIC carries native IP directly, not WireGuard packets.
 
@@ -30,7 +27,7 @@ are preserved. All communicating peers need compatible active modes.
 
 The IPA is **ad-hoc/TrollStore-oriented**, not Apple distribution-signed or an
 App Store/TestFlight release. This release embeds the published fork core
-1.104.1 and WireGuard fork 0.0.34. The iOS bridge adapts the new shared-buffer
+1.104.2 and WireGuard fork 0.0.34. The iOS bridge adapts the new shared-buffer
 TUN API and the new initial-status/peer notification API, preserving the
 complete network snapshot consumed by the app and its extension.
 

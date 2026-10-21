@@ -193,9 +193,10 @@ struct TaildropShareView: View {
         do {
             try await connectVPNAndSetWantRunningOnceForShare()
         } catch {
+            try Task.checkCancellation()
             guard shouldRetryVPNStartAfterShareFailure(error) else { throw error }
             vpnManager.disconnect()
-            await waitForVPNStoppedForShare()
+            try await vpnManager.waitUntilTunnelStopped()
             try await Task.sleep(nanoseconds: 1_000_000_000)
             try await connectVPNAndSetWantRunningOnceForShare()
         }
@@ -208,7 +209,7 @@ struct TaildropShareView: View {
         try await vpnManager.connectTunnel()
 
         loadingMessage = "Waiting for VPN backend..."
-        if let readinessError = await waitForBackendReadyForShare() {
+        if let readinessError = try await waitForBackendReadyForShare() {
             throw classifyBackendReadinessError(readinessError)
         }
 
@@ -219,11 +220,12 @@ struct TaildropShareView: View {
             throw error
         }
 
+        try Task.checkCancellation()
         loadingMessage = "Starting Tailscale..."
         try await LocalAPIClient.vpn(vpnManager).setWantRunning(true, timeout: 10000)
 
         loadingMessage = "Waiting for Tailscale..."
-        if let runningError = await waitForBackendRunningForShare() {
+        if let runningError = try await waitForBackendRunningForShare() {
             throw classifyBackendReadinessError(runningError)
         }
     }
@@ -236,20 +238,22 @@ struct TaildropShareView: View {
     }
 
     @MainActor
-    private func waitForBackendReadyForShare() async -> String? {
+    private func waitForBackendReadyForShare() async throws -> String? {
         var lastError = vpnManager.lastError
 
         for _ in 0..<25 {
+            try Task.checkCancellation()
             let status = vpnManager.updateStatusFromConnection()
             if status == .connected || status == .reasserting {
                 break
             }
-            try? await Task.sleep(nanoseconds: 200_000_000)
+            try await Task.sleep(nanoseconds: 200_000_000)
         }
 
         let deadline = Date().addingTimeInterval(35)
 
         while Date() < deadline {
+            try Task.checkCancellation()
             switch vpnManager.updateStatusFromConnection() {
             case .disconnected, .invalid:
                 return "VPN tunnel stopped before LocalAPI became ready"
@@ -265,6 +269,7 @@ struct TaildropShareView: View {
 
             do {
                 let response = try await LocalAPIClient.vpn(vpnManager).statusResponse(timeout: 1000)
+                try Task.checkCancellation()
                 if response.error == nil {
                     return nil
                 }
@@ -273,21 +278,19 @@ struct TaildropShareView: View {
                 lastError = error.localizedDescription
             }
 
-            try? await Task.sleep(nanoseconds: 200_000_000)
+            try await Task.sleep(nanoseconds: 200_000_000)
         }
 
         return lastError ?? "timed out waiting for LocalAPI"
     }
 
     @MainActor
-    private func waitForBackendRunningForShare() async -> String? {
+    private func waitForBackendRunningForShare() async throws -> String? {
         let deadline = Date().addingTimeInterval(60)
         var lastState = "Starting"
 
         while Date() < deadline {
-            if Task.isCancelled {
-                return "cancelled while waiting for backend to run"
-            }
+            try Task.checkCancellation()
 
             switch vpnManager.updateStatusFromConnection() {
             case .disconnected, .invalid:
@@ -300,6 +303,7 @@ struct TaildropShareView: View {
 
             do {
                 let status = try await LocalAPIClient.vpn(vpnManager).statusObject(timeout: 1000)
+                try Task.checkCancellation()
                 let backendState = status["BackendState"] as? String
                 switch backendState {
                 case "Running":
@@ -324,7 +328,7 @@ struct TaildropShareView: View {
                 loadingMessage = "Waiting for VPN backend..."
             }
 
-            try? await Task.sleep(nanoseconds: 300_000_000)
+            try await Task.sleep(nanoseconds: 300_000_000)
         }
 
         return "timed out waiting for backend to run; last state: \(lastState)"
@@ -374,17 +378,6 @@ struct TaildropShareView: View {
             lowercased.contains("no active vpn session") ||
             lowercased.contains("timed out waiting for localapi") ||
             lowercased.contains("timed out waiting for backend")
-    }
-
-    @MainActor
-    private func waitForVPNStoppedForShare() async {
-        for _ in 0..<25 {
-            let status = vpnManager.updateStatusFromConnection()
-            if status != .connected && status != .connecting && status != .reasserting && status != .disconnecting {
-                return
-            }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
     }
 
     @MainActor

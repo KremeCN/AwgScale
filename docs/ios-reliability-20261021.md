@@ -50,6 +50,23 @@ or source parity. No encrypted-code pseudocode was used as an implementation.
    stale/plaintext fallback. Existing entitlement-free fallback behavior and
    identifiers are preserved.
 
+6. **Share Sheet cancellation and teardown.** The REA report's Share Extension
+   inventory prompted a check of this separate entry point. Its old five-second
+   stop loop silently returned on timeout, and readiness polling swallowed
+   cancellation. It now reuses the tested VPN stop helper, propagates cancelled
+   waits and checks cancellation before starting or restarting backend work.
+
+## Additional REA report assessment
+
+`REA-REPORT.md` dated 2026-10-21 confirms the same IPA digest and encrypted-code
+boundary. It adds App Intents, WidgetKit, File Provider and Share Extension
+metadata. These are feature-discovery leads, not evidence of implementation
+algorithms or demonstrated reliability gains. The current release addresses the
+confirmed Share Sheet wait issue; Siri shortcuts, widgets and Files integration
+remain separate feature work. App Group and Keychain identifiers in the signed
+AwgScale app and its two extensions agree. No reset-keychain switch is added:
+that destructive action is not a recovery policy established by this report.
+
 The core is pinned to fork 1.104.2 (`d7efe75c7cce10651036bda98145e550ce0986ff`),
 WireGuard v0.0.34 (`63cef16b88aab8b23b843beac7ac6f553b7c5fd6`),
 QUIC `10dfe69b6d4ca273c4284ec48d786206af62286e`, and
@@ -76,8 +93,8 @@ published modules with `GOWORK=off`.
 
 ## Remaining acceptance boundaries
 
-This is an unreleased development change, not proof that all app functions
-match the official private client. Simulator tests do not exercise a physical
+This release remains an experimental TrollStore-oriented preview, not proof
+that all app functions match the official private client. Simulator tests do not exercise a physical
 iOS Network Extension, device lock/unlock Keychain policy, background
 suspension, Wi-Fi/cellular handoff, carrier networks or public-WAN throughput.
 
@@ -87,5 +104,5 @@ of that underlying Start across process/instance boundaries. Likewise, system
 callbacks across reuse of one PacketTunnelProvider object need device evidence;
 this patch prevents publication after stopping, not a wholesale redesign of
 all provider callback generations. Those cases remain explicit device test
-items. No public AwgScale release or production-device installation is performed
-as part of this source optimization.
+items. The release uses the existing prerelease channel. No production-device
+installation is performed as part of publication.
