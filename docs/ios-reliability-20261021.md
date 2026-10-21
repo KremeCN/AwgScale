@@ -55,6 +55,8 @@ or source parity. No encrypted-code pseudocode was used as an implementation.
    stop loop silently returned on timeout, and readiness polling swallowed
    cancellation. It now reuses the tested VPN stop helper, propagates cancelled
    waits and checks cancellation before starting or restarting backend work.
+   Initial loading and Retry tasks are owned by the share view and cancelled
+   when Done is tapped or the view disappears.
 
 ## Additional REA report assessment
 

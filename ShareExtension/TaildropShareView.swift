@@ -8,6 +8,7 @@ struct TaildropShareView: View {
     @State private var files: [URL] = []
     @State private var targets: [PeerNode] = []
     @State private var isLoading = true
+    @State private var loadingTask: Task<Void, Never>?
     @State private var loadingMessage = "Loading share..."
     @State private var activePeerID: String?
     @State private var peerSendStates: [String: SharePeerSendState] = [:]
@@ -68,7 +69,8 @@ struct TaildropShareView: View {
                             }
                         } else {
                             Button("Retry") {
-                                Task { await reloadTargets() }
+                                loadingTask?.cancel()
+                                loadingTask = Task { await reloadTargets() }
                             }
                         }
                     }
@@ -85,8 +87,11 @@ struct TaildropShareView: View {
                 }
             }
         }
-        .task {
-            await loadShare()
+        .onAppear {
+            loadingTask = Task { await loadShare() }
+        }
+        .onDisappear {
+            loadingTask?.cancel()
         }
     }
 
@@ -204,6 +209,7 @@ struct TaildropShareView: View {
 
     @MainActor
     private func connectVPNAndSetWantRunningOnceForShare() async throws {
+        try Task.checkCancellation()
         try requireSystemVPNModeForShare()
         loadingMessage = "Starting VPN..."
         try await vpnManager.connectTunnel()
@@ -416,6 +422,7 @@ struct TaildropShareView: View {
     }
 
     private func finish() {
+        loadingTask?.cancel()
         cleanupSharedInputFiles()
         extensionContext?.completeRequest(returningItems: nil)
     }
