@@ -1,0 +1,106 @@
+name: Build TrollStore IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trollstore-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: iOS arm64 IPA
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      GOWORK: 'off'
+      GOTOOLCHAIN: go1.27.3
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Record build environment
+        run: |
+          set -euo pipefail
+          mkdir -p build/ci
+          {
+            printf 'Commit: %s\nRef: %s\n' "$GITHUB_SHA" "$GITHUB_REF"
+            sw_vers
+            xcode-select -p
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-version
+            go version
+          } | tee build/ci/environment.txt
+
+      - name: Build device Go framework
+        run: |
+          set -euo pipefail
+          ./build_go.sh --device 2>&1 | tee build/ci/go-framework.log
+
+      - name: Build and package TrollStore IPA
+        run: |
+          set -euo pipefail
+          # Default mode ad-hoc signs the app and extensions with entitlements.
+          # Do not use --pure-unsigned for TrollStore.
+          ./build_unsigned_ipa.sh 2>&1 | tee build/ci/ipa-build.log
+
+      - name: Verify package and capture entitlements
+        run: |
+          set -euo pipefail
+          IPA=build/unsigned-ipa/AwgScale-trollstore.ipa
+          APP=build/unsigned-ipa/staging/Payload/AwgScale.app
+          test -s "$IPA"
+          unzip -t "$IPA" | tee build/ci/ipa-integrity.txt
+          codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tee build/ci/signature-verification.txt
+          codesign -d --entitlements :- "$APP" > build/ci/app-entitlements.plist 2> build/ci/app-signature.txt
+          for extension in "$APP"/PlugIns/*.appex; do
+            name="$(basename "$extension" .appex)"
+            codesign -d --entitlements :- "$extension" > "build/ci/${name}-entitlements.plist" 2> "build/ci/${name}-signature.txt"
+          done
+          shasum -a 256 "$IPA" | tee build/ci/SHA256SUMS.txt
+
+      - name: Upload TrollStore IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: AwgScale-trollstore-${{ github.sha }}
+          path: |
+            build/unsigned-ipa/AwgScale-trollstore.ipa
+            build/ci/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AwgScale-build-diagnostics-${{ github.sha }}
+          path: build/ci/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write build summary
+        if: always()
+        run: |
+          {
+            printf '## TrollStore IPA build\n\n'
+            printf -- '- Commit: `%s`\n' "$GITHUB_SHA"
+            printf -- '- Job result: %s\n' '${{ job.status }}'
+            printf -- '- Download the IPA artifact, extract the ZIP, and open the IPA in TrollStore.\n'
+            printf -- '- No Apple certificate or provisioning profile is used. TrollStore must have ldid installed.\n'
+            printf -- '- This device-only build does not run XCTest or validate VPN traffic on a physical device.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
