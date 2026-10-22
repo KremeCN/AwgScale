@@ -2,6 +2,41 @@ import XCTest
 @testable import AwgScale
 
 final class LocalAPITests: XCTestCase {
+    func testBodylessResponsesNeverCallGomobileReader() throws {
+        for status in [204, 205, 304] {
+            let body = try localAPIResponseBody(statusCode: status, method: "POST", readBody: true) {
+                XCTFail("A bodyless response must not cross the NSData bridge")
+                throw NSError(domain: "bridge", code: 1)
+            }
+            XCTAssertTrue(body.isEmpty)
+        }
+        XCTAssertTrue(localAPIResponseBody(statusCode: 200, method: "HEAD", readBody: true) {
+            XCTFail("HEAD must not read a body")
+            return Data()
+        }.isEmpty)
+    }
+
+    func testRealBodyReadFailuresAreNotSwallowed() {
+        XCTAssertThrowsError(try localAPIResponseBody(statusCode: 200, method: "GET", readBody: true) {
+            throw NSError(domain: "read", code: 2)
+        })
+        let expected = Data("response".utf8)
+        XCTAssertEqual(localAPIResponseBody(statusCode: 200, method: "GET", readBody: true) { expected }, expected)
+    }
+
+    func testAuthKeyErrorsKeepStageAndStatusButNotSecrets() {
+        let error = LocalAPIError.unsuccessfulStatus(statusCode: 500, endpoint: "secret-key", bodyPreview: "secret-key")
+        let submit = authKeyLoginFailureMessage(error, activating: false)
+        let activate = authKeyLoginFailureMessage(error, activating: true)
+        XCTAssertTrue(submit.contains("submit"))
+        XCTAssertTrue(activate.contains("registration"))
+        XCTAssertTrue(submit.contains("HTTP 500"))
+        XCTAssertFalse(submit.contains("secret-key"))
+        XCTAssertFalse(activate.contains("secret-key"))
+        let unknown = NSError(domain: "secret-key", code: 42, userInfo: [NSLocalizedDescriptionKey: "secret-key"])
+        XCTAssertFalse(authKeyLoginFailureMessage(unknown, activating: false).contains("secret-key"))
+    }
+
     private struct Sample: Codable, Equatable {
         let value: String
     }
@@ -87,7 +122,7 @@ final class LocalAPITests: XCTestCase {
             XCTAssertEqual(method, "POST")
             XCTAssertEqual(endpoint, "/localapi/v0/start")
             XCTAssertEqual(timeout, 30_000)
-            XCTAssertTrue(readBody)
+            XCTAssertFalse(readBody, "A successful /start has no response body")
             return .success(statusCode: 401, body: Data("registration rejected".utf8))
         }
         do {

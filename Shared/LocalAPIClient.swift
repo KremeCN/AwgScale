@@ -158,7 +158,9 @@ struct LocalAPIClient {
     func login(authKey: String) async throws {
         let endpoint = "/localapi/v0/start"
         let body = try JSONEncoder().encode(["AuthKey": authKey])
-        let resp = try await execute("POST", endpoint, body, 30000, true)
+        // /start succeeds with 204. Empty []byte becomes nil NSData through
+        // gomobile's NSError-returning bridge and can throw in Swift.
+        let resp = try await execute("POST", endpoint, body, 30000, false)
         try resp.requireSuccess(endpoint: endpoint)
     }
 

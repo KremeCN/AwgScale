@@ -78,7 +78,9 @@ enum GoBridge {
         let goResp = try app.callLocalAPI(timeoutMillis, method: method, endpoint: endpoint, body: inputStream)
 
         let statusCode = goResp.statusCode()
-        let bodyData = readBody ? try goResp.bodyBytes() : Data()
+        let bodyData = try localAPIResponseBody(statusCode: statusCode, method: method, readBody: readBody) {
+            try goResp.bodyBytes()
+        }
 
         return LocalAPIResponse(statusCode: statusCode, body: bodyData)
     }
@@ -98,7 +100,9 @@ enum GoBridge {
         let goResp = try app.callLocalAPI(timeoutMillis, method: method, endpoint: endpoint, body: inputStream)
 
         let statusCode = goResp.statusCode()
-        let bodyData = readBody ? try goResp.bodyBytes() : Data()
+        let bodyData = try localAPIResponseBody(statusCode: statusCode, method: method, readBody: readBody) {
+            try goResp.bodyBytes()
+        }
 
         return LocalAPIResponse(statusCode: statusCode, body: bodyData)
     }
@@ -146,7 +150,9 @@ enum GoBridge {
         )
 
         let statusCode = goResp.statusCode()
-        let bodyData = readBody ? try goResp.bodyBytes() : Data()
+        let bodyData = try localAPIResponseBody(statusCode: statusCode, method: "POST", readBody: readBody) {
+            try goResp.bodyBytes()
+        }
 
         return LocalAPIResponse(statusCode: statusCode, body: bodyData)
     }

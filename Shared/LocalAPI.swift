@@ -1,5 +1,39 @@
 import Foundation
 
+/// Do not cross gomobile's nullable NSData/NSError bridge for HTTP responses
+/// that cannot contain a body. Real body-read failures must still propagate.
+func localAPIResponseBody(statusCode: Int, method: String, readBody: Bool,
+                          read: () throws -> Data) rethrows -> Data {
+    guard readBody, method.uppercased() != "HEAD",
+          statusCode != 204, statusCode != 205, statusCode != 304,
+          !(100..<200).contains(statusCode) else { return Data() }
+    return try read()
+}
+
+/// Only trusted labels and numeric status codes reach the login UI. Raw
+/// backend descriptions, response bodies and NSError userInfo may contain keys.
+func authKeyLoginFailureMessage(_ error: Error, activating: Bool) -> String {
+    let stage = activating ? "Could not start device registration" : "Could not submit the auth key to the app backend"
+    if let local = error as? LocalAPIError {
+        switch local {
+        case .unsuccessfulStatus(let status, _, _):
+            return "\(stage) (LocalAPI HTTP \(status)). This does not necessarily mean the key is invalid."
+        case .backend:
+            return "\(stage): the app backend could not complete the request."
+        case .missingBody, .invalidBodyEncoding, .decoding:
+            return "\(stage): an invalid local response was received."
+        }
+    }
+    let nsError = error as NSError
+    if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorTimedOut {
+        return "\(stage): the request timed out. Check connectivity and retry."
+    }
+    if error is CancellationError {
+        return "\(stage): the request was cancelled."
+    }
+    return "\(stage): a local bridge or transport error occurred (code \(nsError.code))."
+}
+
 enum LocalAPIError: Error, LocalizedError {
     case backend(String)
     case unsuccessfulStatus(statusCode: Int, endpoint: String, bodyPreview: String?)

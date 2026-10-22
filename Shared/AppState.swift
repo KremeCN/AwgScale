@@ -1362,8 +1362,14 @@ class AppState: ObservableObject {
                 authKeySubmitted = true
                 do {
                     try await LocalAPIClient.login(loginBackend).login(authKey: authKey)
+                } catch {
                     guard isActiveLoginAttempt(loginAttemptID) else { return }
-                    authKeyRequestAccepted = true
+                    failActiveLogin(authKeyLoginFailureMessage(error, activating: false), loginAttemptID: loginAttemptID)
+                    return
+                }
+                guard isActiveLoginAttempt(loginAttemptID) else { return }
+                authKeyRequestAccepted = true
+                do {
                     // Start installs the key on the control client; the false→true
                     // preference transition initiates Login without a browser.
                     try await LocalAPIClient.login(loginBackend).setWantRunning(true)
@@ -1371,8 +1377,7 @@ class AppState: ObservableObject {
                     startAuthKeyMonitor(loginAttemptID: loginAttemptID)
                 } catch {
                     guard isActiveLoginAttempt(loginAttemptID) else { return }
-                    // Server errors may echo credentials. Never render the raw response.
-                    failActiveLogin("Auth key sign-in failed. Check that the key is valid and the server is reachable.", loginAttemptID: loginAttemptID)
+                    failActiveLogin(authKeyLoginFailureMessage(error, activating: true), loginAttemptID: loginAttemptID)
                 }
                 return
             }
