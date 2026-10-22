@@ -2,6 +2,9 @@ name: Build TrollStore IPA
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - feature/auth-key-login
 
 permissions:
   contents: read
