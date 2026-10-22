@@ -4,6 +4,7 @@ import SwiftUI
 struct LoginView: View {
     @EnvironmentObject var appState: AppState
     @State private var showingCustomServerLogin = false
+    @State private var showingAuthKeyLogin = false
 
     var body: some View {
         VStack(spacing: 24) {
@@ -60,7 +61,7 @@ struct LoginView: View {
                     .cornerRadius(12)
             }
             .padding(.horizontal, 32)
-            .disabled(appState.isLoggingIn)
+            .disabled(appState.isLoggingIn || appState.isSwitchingNetworkMode)
 
             Button {
                 showingCustomServerLogin = true
@@ -72,11 +73,23 @@ struct LoginView: View {
             }
             .buttonStyle(.plain)
             .foregroundColor(.accentColor)
-            .disabled(appState.isLoggingIn)
+            .disabled(appState.isLoggingIn || appState.isSwitchingNetworkMode)
             .sheet(isPresented: $showingCustomServerLogin) {
                 CustomServerLoginView { controlURL in
                     showingCustomServerLogin = false
                     appState.startLogin(controlURL: controlURL)
+                }
+            }
+
+            Button("Use Auth Key") {
+                showingAuthKeyLogin = true
+            }
+            .font(.footnote.weight(.medium))
+            .disabled(appState.isLoggingIn || appState.isSwitchingNetworkMode)
+            .sheet(isPresented: $showingAuthKeyLogin) {
+                AuthKeyLoginView { key, server in
+                    showingAuthKeyLogin = false
+                    appState.startAuthKeyLogin(authKey: key, controlURL: server)
                 }
             }
 
@@ -100,6 +113,82 @@ struct LoginView: View {
 
             Spacer()
         }
+    }
+}
+
+private struct AuthKeyLoginView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var authKey = ""
+    @State private var useCustomServer = false
+    @State private var controlURL = ""
+    @State private var validationError: String?
+    let onContinue: (String, String) -> Void
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("Authentication") {
+                    SecureField("Auth Key", text: $authKey)
+                        .autocapitalization(.none)
+                        .autocorrectionDisabled()
+                }
+                Section {
+                    Toggle("Use Custom Control Server", isOn: $useCustomServer)
+                    if useCustomServer {
+                        TextField("https://headscale.example.com", text: $controlURL)
+                            .keyboardType(.URL)
+                            .autocapitalization(.none)
+                            .autocorrectionDisabled()
+                    }
+                } header: {
+                    Text("Control Server")
+                } footer: {
+                    if useCustomServer && controlURL.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("http://") {
+                        Text("HTTP sends your auth key without encryption. Use HTTPS unless this is a trusted local server.")
+                    } else {
+                        Text("Use an auth key from your control plane admin console.")
+                    }
+                }
+                if let validationError {
+                    Section {
+                        Label(validationError, systemImage: "exclamationmark.triangle")
+                            .foregroundColor(.red)
+                    }
+                }
+                Section {
+                    Button("Sign In", action: submit)
+                        .disabled(authKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .navigationTitle("Auth Key Sign In")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        authKey = ""
+                        dismiss()
+                    }
+                }
+            }
+            .onDisappear { authKey = "" }
+        }
+    }
+
+    private func submit() {
+        let key = authKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+        let server: String
+        if useCustomServer {
+            guard let normalized = normalizedCustomControlServerURL(controlURL) else {
+                validationError = "Enter a valid http or https control server URL."
+                return
+            }
+            server = normalized
+        } else {
+            server = officialControlServerURL
+        }
+        authKey = ""
+        onContinue(key, server)
     }
 }
 

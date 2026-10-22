@@ -82,6 +82,22 @@ final class LocalAPITests: XCTestCase {
         XCTAssertEqual(startOptions, ["AuthKey": "tskey-auth-test"])
     }
 
+    func testAuthKeyLoginPropagatesRejectedStart() async {
+        let client = LocalAPIClient { method, endpoint, _, timeout, readBody in
+            XCTAssertEqual(method, "POST")
+            XCTAssertEqual(endpoint, "/localapi/v0/start")
+            XCTAssertEqual(timeout, 30_000)
+            XCTAssertTrue(readBody)
+            return .success(statusCode: 401, body: Data("registration rejected".utf8))
+        }
+        do {
+            try await client.login(authKey: "key")
+            XCTFail("A rejected start must throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("401"))
+        }
+    }
+
     func testBugReportUsesRequiredPOSTMethod() async throws {
         var capturedMethod = ""
         var capturedEndpoint = ""

@@ -42,6 +42,7 @@ struct IpnNotify: Codable {
     let FilesWaiting: EmptyMessage?
     let IncomingFiles: [TaildropIncomingFile]?
     let OutgoingFiles: [TaildropOutgoingFile]?
+    var ErrMessage: String? = nil
 
     struct LoginFinished: Codable {}
 }

@@ -37,7 +37,255 @@ private actor LocalPrefsResponseGate {
 }
 
 @MainActor
+private final class AuthKeyHarness {
+    var requests: [(String, String, Data?)] = []
+    var callbacks: [(Data) -> Void] = []
+    var stops = 0
+    var backendState = "NeedsLogin"
+    var profile = #"{"ID":"","Name":"","ControlURL":"https://controlplane.tailscale.com"}"#
+    var startStatus = 200
+    var onStart: (() -> Void)?
+    var wantRunning = false
+    var installedKey = false
+    var gateStart: CheckedContinuation<IPCResponse, Never>?
+    var holdStart = false
+
+    lazy var backend = AppLoginBackend(runtime: .init(
+        start: {},
+        stop: { self.stops += 1 },
+        callLocalAPI: { method, endpoint, body, _, _ in
+            self.requests.append((method, endpoint, body))
+            switch endpoint {
+            case "/localapi/v0/status":
+                return .success(statusCode: 200, body: Data("{\"BackendState\":\"\(self.backendState)\"}".utf8))
+            case "/localapi/v0/profiles/current":
+                return .success(statusCode: 200, body: Data(self.profile.utf8))
+            case "/localapi/v0/prefs":
+                if let body, let prefs = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                   let running = prefs["WantRunning"] as? Bool {
+                    if !self.wantRunning && running && self.installedKey { self.onStart?() }
+                    self.wantRunning = running
+                }
+                return .success(statusCode: 200, body: Data("{}".utf8))
+            case "/localapi/v0/start":
+                self.installedKey = true
+                if self.holdStart {
+                    return await withCheckedContinuation { self.gateStart = $0 }
+                }
+                return .success(statusCode: self.startStatus, body: Data("secret-key".utf8))
+            default:
+                return .success(statusCode: 200, body: Data("{}".utf8))
+            }
+        },
+        watchNotifications: { callback in
+            self.callbacks.append(callback)
+            return NotificationHandle()
+        },
+        stopNotifications: { _ in }
+    ))
+
+    func emit(_ json: String, callback: Int = 0) {
+        callbacks[callback](Data(json.utf8))
+    }
+
+    func authenticate() {
+        backendState = "Running"
+        profile = #"{"ID":"registered","Name":"user","UserProfile":{"ID":1},"ControlURL":"https://controlplane.tailscale.com"}"#
+    }
+}
+
+@MainActor
 final class AppStateTests: XCTestCase {
+    private func waitUntil(_ condition: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async {
+        for _ in 0..<2000 {
+            if condition() { return }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTFail("Condition was not reached", file: file, line: line)
+    }
+
+    func testAuthKeyValidationDoesNotStartBackend() {
+        let h = AuthKeyHarness()
+        let state = AppState(loginBackend: h.backend)
+        state.startAuthKeyLogin(authKey: "  ")
+        XCTAssertFalse(state.isLoggingIn)
+        state.startAuthKeyLogin(authKey: "key", controlURL: "ftp://invalid")
+        XCTAssertFalse(state.isLoggingIn)
+        XCTAssertTrue(h.requests.isEmpty)
+    }
+
+    func testAuthKeyAcceptedRequestAndStoppedWithoutIdentityDoNotComplete() async {
+        let h = AuthKeyHarness()
+        h.backendState = "Stopped"
+        let state = AppState(loginBackend: h.backend, authKeyPollInterval: 1_000_000)
+        defer { h.backend.stop() }
+        state.startAuthKeyLogin(authKey: " secret-key ")
+        await waitUntil { h.wantRunning }
+        XCTAssertTrue(state.isLoggingIn)
+        XCTAssertNil(state.currentProfile)
+        XCTAssertFalse(h.requests.contains { $0.1.contains("login-interactive") })
+        let start = h.requests.first { $0.1 == "/localapi/v0/start" }
+        let body = start?.2.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: String] }
+        XCTAssertEqual(body?["AuthKey"], "secret-key")
+        state.cancelLogin()
+    }
+
+    func testAuthKeySuccessKeepsAppOnlyBackend() async {
+        let h = AuthKeyHarness()
+        h.onStart = { h.authenticate() }
+        let state = AppState(vpnPermissionCapability: false, loginBackend: h.backend, authKeyPollInterval: 1_000_000)
+        state.startAuthKeyLogin(authKey: "key")
+        await waitUntil { !state.isLoggingIn }
+        XCTAssertEqual(state.currentProfile?.ID, "registered")
+        XCTAssertTrue(h.backend.isRunning)
+        let prefs = h.requests.filter { $0.0 == "PATCH" }.compactMap { $0.2 }
+        XCTAssertTrue(prefs.contains { String(data: $0, encoding: .utf8)?.contains(officialControlServerURL) == true })
+        h.backend.stop()
+    }
+
+    func testAuthKeySuccessStopsTemporaryVPNLoginBackend() async {
+        let h = AuthKeyHarness()
+        h.onStart = { h.authenticate() }
+        let state = AppState(vpnPermissionCapability: true, loginBackend: h.backend, authKeyPollInterval: 1_000_000)
+        state.usesVPNPermission = true
+        state.startAuthKeyLogin(authKey: "key")
+        await waitUntil { !state.isLoggingIn }
+        XCTAssertEqual(state.currentProfile?.ID, "registered")
+        XCTAssertFalse(h.backend.isRunning)
+        XCTAssertEqual(h.stops, 1)
+    }
+
+    func testAuthKeyConfirmationDeadlineDoesNotTreatNeedsLoginAsSuccess() async throws {
+        let h = AuthKeyHarness()
+        let state = AppState(loginBackend: h.backend, authKeyLoginTimeout: 0.1, authKeyPollInterval: 1_000_000)
+        state.startAuthKeyLogin(authKey: "key")
+        await waitUntil { h.wantRunning }
+        XCTAssertTrue(state.isLoggingIn)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(state.isLoggingIn)
+        XCTAssertNil(state.currentProfile)
+        XCTAssertTrue(state.lastError?.contains("timed out") == true)
+    }
+
+    func testAuthKeyHTTPFailureDoesNotExposeServerBody() async {
+        let h = AuthKeyHarness()
+        h.startStatus = 401
+        let state = AppState(loginBackend: h.backend)
+        state.startAuthKeyLogin(authKey: "secret-key")
+        await waitUntil { !state.isLoggingIn }
+        XCTAssertNotNil(state.lastError)
+        XCTAssertFalse(state.lastError?.contains("secret-key") == true)
+        XCTAssertFalse(h.backend.isRunning)
+        XCTAssertTrue(state.shouldShowLoginView)
+    }
+
+    func testAuthKeyAsyncErrorAndBrowseURLAreNotExposed() async {
+        let h = AuthKeyHarness()
+        let state = AppState(loginBackend: h.backend)
+        state.startAuthKeyLogin(authKey: "secret-key")
+        await waitUntil { h.requests.contains { $0.1 == "/localapi/v0/start" } }
+        h.emit(#"{"BrowseToURL":"https://example.com/secret-key"}"#)
+        await Task.yield()
+        XCTAssertNil(state.browseToURL)
+        h.emit(#"{"ErrMessage":"invalid secret-key"}"#)
+        await waitUntil { !state.isLoggingIn }
+        XCTAssertFalse(state.lastError?.contains("secret-key") == true)
+    }
+
+    func testAuthKeyApprovalSurvivesRegistrationDeadline() async throws {
+        let h = AuthKeyHarness()
+        h.onStart = { h.backendState = "NeedsMachineAuth" }
+        let state = AppState(vpnPermissionCapability: false, loginBackend: h.backend, authKeyLoginTimeout: 0.1, authKeyPollInterval: 1_000_000)
+        state.startAuthKeyLogin(authKey: "key", controlURL: "headscale.example.com")
+        await waitUntil { state.isAwaitingMachineAuth }
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(state.isAwaitingMachineAuth)
+        XCTAssertTrue(state.isLoggingIn)
+        h.authenticate()
+        await waitUntil { !state.isLoggingIn }
+        XCTAssertFalse(state.isAwaitingMachineAuth)
+        h.backend.stop()
+    }
+
+    func testAuthKeyDeadlineBoundsHungRequestAndIgnoresLateResponse() async throws {
+        let h = AuthKeyHarness()
+        h.holdStart = true
+        let state = AppState(loginBackend: h.backend, authKeyLoginTimeout: 0.1)
+        state.startAuthKeyLogin(authKey: "key")
+        await waitUntil { h.gateStart != nil }
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(state.isLoggingIn)
+        XCTAssertTrue(state.lastError?.contains("timed out") == true)
+        h.gateStart?.resume(returning: .success(statusCode: 200))
+        h.gateStart = nil
+        await Task.yield()
+        XCTAssertNil(state.currentProfile)
+        XCTAssertFalse(h.backend.isRunning)
+    }
+
+    func testAuthKeyEarlyNotificationCancelRetryAndOldCallback() async {
+        let h = AuthKeyHarness()
+        h.holdStart = true
+        let state = AppState(vpnPermissionCapability: false, loginBackend: h.backend, authKeyPollInterval: 1_000_000)
+        state.startAuthKeyLogin(authKey: "first")
+        state.startAuthKeyLogin(authKey: "duplicate")
+        await waitUntil { h.gateStart != nil }
+        h.emit(#"{"LoginFinished":{}}"#)
+        await Task.yield()
+        XCTAssertTrue(state.isLoggingIn)
+        XCTAssertEqual(h.requests.filter { $0.1 == "/localapi/v0/start" }.count, 1)
+        state.cancelLogin()
+        await waitUntil { !state.isLoggingOut }
+        h.gateStart?.resume(returning: .success(statusCode: 200))
+        h.gateStart = nil
+        h.holdStart = false
+        state.startAuthKeyLogin(authKey: "second")
+        await waitUntil { h.callbacks.count == 2 }
+        h.emit(#"{"ErrMessage":"old error"}"#, callback: 0)
+        await Task.yield()
+        XCTAssertTrue(state.isLoggingIn)
+        h.authenticate()
+        await waitUntil { !state.isLoggingIn }
+        XCTAssertEqual(state.currentProfile?.ID, "registered")
+        h.backend.stop()
+    }
+
+    func testAuthKeyApprovalLossReturnsToLogin() async {
+        let h = AuthKeyHarness()
+        h.onStart = { h.backendState = "NeedsMachineAuth" }
+        let state = AppState(loginBackend: h.backend, authKeyPollInterval: 1_000_000)
+        state.startAuthKeyLogin(authKey: "key")
+        await waitUntil { state.isAwaitingMachineAuth }
+        h.backendState = "NeedsLogin"
+        await waitUntil { !state.isLoggingIn }
+        XCTAssertFalse(state.isAwaitingMachineAuth)
+        XCTAssertTrue(state.shouldShowLoginView)
+        state.loadSharedState()
+        XCTAssertNotNil(state.lastError)
+    }
+
+    func testBrowserLoginStillUsesInteractiveEndpoint() async {
+        let h = AuthKeyHarness()
+        let state = AppState(loginBackend: h.backend)
+        state.startLogin()
+        await waitUntil { h.requests.contains { $0.1 == "/localapi/v0/login-interactive" } }
+        XCTAssertFalse(h.requests.contains { request in
+            request.2.map { String(data: $0, encoding: .utf8)?.contains("AuthKey") == true } == true
+        })
+        state.cancelLogin()
+        await waitUntil { !state.isLoggingOut }
+    }
+
+    func testAuthKeyRefusesExistingAccount() {
+        let h = AuthKeyHarness()
+        let state = AppState(loginBackend: h.backend)
+        state.currentProfile = LoginProfile(ID: "existing", Name: "user", Key: nil, UserProfile: nil, NetworkProfile: nil, LocalUserID: nil, ControlURL: officialControlServerURL)
+        state.startAuthKeyLogin(authKey: "key")
+        XCTAssertFalse(state.isLoggingIn)
+        XCTAssertEqual(state.currentProfile?.ID, "existing")
+        XCTAssertTrue(h.requests.isEmpty)
+    }
+
 
     func testLoginControlServerResolutionUsesExplicitOfficialDefault() {
         XCTAssertEqual(resolvedLoginControlServerURL(nil), officialControlServerURL)

@@ -357,7 +357,16 @@ class AppState: ObservableObject {
 
     /// Reference to VPNManager for IPC. Set by the app at launch.
     weak var vpnManager: VPNManager?
-    private let loginBackend = AppLoginBackend()
+    private let loginBackend: AppLoginBackend
+    private let authKeyLoginTimeout: TimeInterval
+    private let authKeyPollInterval: UInt64
+    private var isAuthKeyLogin = false
+    private var authKeySubmitted = false
+    private var authKeyRequestAccepted = false
+    private var authKeyLoginFinished = false
+    private var authKeyRecoveryBegan: Date?
+    private var authKeyMonitorTask: Task<Void, Never>?
+    private var authKeyDeadlineTask: Task<Void, Never>?
     private var isCompletingAppLogin = false
     private var loginStartTask: Task<Void, Never>?
     private var loginCompletionTask: Task<Void, Never>?
@@ -585,6 +594,8 @@ class AppState: ObservableObject {
     }
 
     private func showMachineAuthPending() {
+        authKeyDeadlineTask?.cancel()
+        authKeyDeadlineTask = nil
         ipnState = .needsMachineAuth
         isAwaitingMachineAuth = true
         loginMachineAuthPending = true
@@ -593,7 +604,13 @@ class AppState: ObservableObject {
 
     // MARK: - Initialization
 
-    init(vpnPermissionCapability: Bool = hasPacketTunnelProviderEntitlement()) {
+    init(vpnPermissionCapability: Bool = hasPacketTunnelProviderEntitlement(),
+         loginBackend: AppLoginBackend? = nil,
+         authKeyLoginTimeout: TimeInterval = 120,
+         authKeyPollInterval: UInt64 = 1_000_000_000) {
+        self.loginBackend = loginBackend ?? AppLoginBackend()
+        self.authKeyLoginTimeout = authKeyLoginTimeout
+        self.authKeyPollInterval = authKeyPollInterval
         self.canUseVPNPermission = vpnPermissionCapability
         self.usesVPNPermission = defaultVPNPermissionEnabled(hasVPNCapability: vpnPermissionCapability)
 
@@ -902,6 +919,11 @@ class AppState: ObservableObject {
     }
 
     private func applyNotify(_ notify: IpnNotify, fromLoginBackend: Bool = false) {
+        if fromLoginBackend, isAuthKeyLogin, authKeySubmitted,
+           let error = notify.ErrMessage, !error.isEmpty {
+            failActiveLogin("Auth key sign-in was rejected by the server. Check the key and server configuration.")
+            return
+        }
         var clearsBackendSnapshot = false
         if let stateInt = notify.State, let state = IpnState(rawValue: stateInt) {
             ipnState = state
@@ -911,7 +933,7 @@ class AppState: ObservableObject {
             }
             if state == .needsMachineAuth && fromLoginBackend && canShowMachineAuthDuringLogin {
                 showMachineAuthPending()
-                startLoginCompletionPolling()
+                if !isAuthKeyLogin { startLoginCompletionPolling() }
             }
         }
 
@@ -934,9 +956,13 @@ class AppState: ObservableObject {
         }
 
         if notify.LoginFinished != nil {
-            isLoggingIn = false
-            browseToURL = nil
-            finishAppLogin()
+            if fromLoginBackend, isAuthKeyLogin {
+                if authKeySubmitted { authKeyLoginFinished = true }
+            } else {
+                isLoggingIn = false
+                browseToURL = nil
+                finishAppLogin()
+            }
         }
 
         if !clearsBackendSnapshot,
@@ -961,6 +987,7 @@ class AppState: ObservableObject {
     }
 
     private func applyLoginBackendBrowseURL(_ url: String) {
+        guard !isAuthKeyLogin else { return }
         guard isLoggingIn,
               activeLoginAttemptID != nil,
               let controlServerURL = activeLoginControlServerURL else {
@@ -1224,6 +1251,19 @@ class AppState: ObservableObject {
     /// Login runs a temporary in-app Go backend so the browser auth flow can
     /// complete before the user chooses to turn AwgScale on.
     func startLogin(controlURL: String? = nil) {
+        beginLogin(controlURL: controlURL, authKey: nil)
+    }
+
+    func startAuthKeyLogin(authKey: String, controlURL: String? = nil) {
+        let key = authKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            lastError = "Enter an auth key."
+            return
+        }
+        beginLogin(controlURL: controlURL, authKey: key)
+    }
+
+    private func beginLogin(controlURL: String?, authKey: String?) {
         guard !isLoggingOut else {
             lastError = "Wait for logout to finish before signing in."
             return
@@ -1247,7 +1287,20 @@ class AppState: ObservableObject {
         let loginAttemptID = UUID()
         activeLoginAttemptID = loginAttemptID
         activeLoginControlServerURL = selectedControlServerURL
+        isAuthKeyLogin = authKey != nil
         isLoggingIn = true
+        if isAuthKeyLogin {
+            // A separate deadline also bounds a stalled registration request.
+            authKeyDeadlineTask = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(max(0, authKeyLoginTimeout) * 1_000_000_000))
+                } catch { return }
+                guard activeLoginAttemptID == loginAttemptID,
+                      !isAwaitingMachineAuth else { return }
+                failActiveLogin("Auth key sign-in timed out. Check the server and try again.", loginAttemptID: loginAttemptID)
+            }
+        }
         isAwaitingMachineAuth = false
         loginMachineAuthPending = false
         loginBrowserWasPresented = false
@@ -1267,14 +1320,24 @@ class AppState: ObservableObject {
                 }
             } catch {
                 failActiveLogin(
-                    "Login backend failed to start: \(describeError(error))",
+                    "Login backend failed to start: \(authKey == nil ? describeError(error) : "Unable to start the login backend.")",
                     loginAttemptID: loginAttemptID
                 )
                 return
             }
 
             guard isActiveLoginAttempt(loginAttemptID) else { return }
-            await setLoginBackendWantRunning(false)
+            if authKey == nil {
+                await setLoginBackendWantRunning(false)
+            } else {
+                do {
+                    try await LocalAPIClient.login(loginBackend).setWantRunning(false)
+                } catch {
+                    guard isActiveLoginAttempt(loginAttemptID) else { return }
+                    failActiveLogin("Unable to prepare auth key sign-in. Try again.", loginAttemptID: loginAttemptID)
+                    return
+                }
+            }
             guard isActiveLoginAttempt(loginAttemptID) else { return }
 
             // Set the control URL for every attempt. In particular, official
@@ -1283,16 +1346,36 @@ class AppState: ObservableObject {
                 let prefs = MaskedPrefs.setControlURL(selectedControlServerURL)
                 let updatedPrefsData = try await editLoginBackendPrefs(prefs)
                 guard isActiveLoginAttempt(loginAttemptID) else { return }
-                try await startLoginBackend(updatePrefsData: updatedPrefsData)
+                if authKey == nil {
+                    try await startLoginBackend(updatePrefsData: updatedPrefsData)
+                }
             } catch {
                 failActiveLogin(
-                    "Failed to set control server: \(describeError(error))",
+                    "Failed to set control server: \(authKey == nil ? describeError(error) : "Unable to configure the login server.")",
                     loginAttemptID: loginAttemptID
                 )
                 return
             }
 
             guard isActiveLoginAttempt(loginAttemptID) else { return }
+            if let authKey {
+                authKeySubmitted = true
+                do {
+                    try await LocalAPIClient.login(loginBackend).login(authKey: authKey)
+                    guard isActiveLoginAttempt(loginAttemptID) else { return }
+                    authKeyRequestAccepted = true
+                    // Start installs the key on the control client; the false→true
+                    // preference transition initiates Login without a browser.
+                    try await LocalAPIClient.login(loginBackend).setWantRunning(true)
+                    guard isActiveLoginAttempt(loginAttemptID) else { return }
+                    startAuthKeyMonitor(loginAttemptID: loginAttemptID)
+                } catch {
+                    guard isActiveLoginAttempt(loginAttemptID) else { return }
+                    // Server errors may echo credentials. Never render the raw response.
+                    failActiveLogin("Auth key sign-in failed. Check that the key is valid and the server is reachable.", loginAttemptID: loginAttemptID)
+                }
+                return
+            }
             do {
                 let resp = try await loginBackend.startLoginInteractive()
                 guard isActiveLoginAttempt(loginAttemptID) else { return }
@@ -1317,7 +1400,65 @@ class AppState: ObservableObject {
             && activeLoginAttemptID == loginAttemptID
     }
 
+    private func resetAuthKeyAttempt() {
+        authKeyMonitorTask?.cancel()
+        authKeyMonitorTask = nil
+        authKeyDeadlineTask?.cancel()
+        authKeyDeadlineTask = nil
+        isAuthKeyLogin = false
+        authKeySubmitted = false
+        authKeyRequestAccepted = false
+        authKeyLoginFinished = false
+        authKeyRecoveryBegan = nil
+    }
+
+    private func startAuthKeyMonitor(loginAttemptID: UUID) {
+        guard authKeyMonitorTask == nil else { return }
+        authKeyMonitorTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled, activeLoginAttemptID == loginAttemptID {
+                await checkAuthKeyResult(loginAttemptID: loginAttemptID)
+                do { try await Task.sleep(nanoseconds: authKeyPollInterval) }
+                catch { return }
+            }
+        }
+    }
+
+    private func authKeyCompletionStateIsValid(_ state: IpnState?) -> Bool {
+        state == .running || state == .starting || (state == .stopped && authKeyLoginFinished)
+    }
+
+    private func checkAuthKeyResult(loginAttemptID: UUID) async {
+        guard isActiveLoginAttempt(loginAttemptID), authKeyRequestAccepted else { return }
+        let state = await loginBackendState()
+        guard isActiveLoginAttempt(loginAttemptID) else { return }
+        if isAwaitingMachineAuth, state == .needsLogin || state == .noState {
+            failActiveLogin("Device authorization is no longer valid. Sign in again.", loginAttemptID: loginAttemptID)
+            return
+        }
+        if state == .needsMachineAuth {
+            authKeyRecoveryBegan = nil
+            showMachineAuthPending()
+            return
+        }
+        if isAwaitingMachineAuth {
+            let began = authKeyRecoveryBegan ?? Date()
+            authKeyRecoveryBegan = began
+            if Date().timeIntervalSince(began) >= authKeyLoginTimeout {
+                failActiveLogin("Unable to confirm device authorization. Sign in again.", loginAttemptID: loginAttemptID)
+                return
+            }
+        }
+        guard authKeyCompletionStateIsValid(state) else { return }
+        guard let profile = try? await LocalAPIClient.login(loginBackend).currentProfile(),
+              !profile.ID.isEmpty,
+              profile.UserProfile?.ID != nil else { return }
+        guard isActiveLoginAttempt(loginAttemptID) else { return }
+        finishAppLogin()
+    }
+
     private func invalidateActiveLoginAttempt() {
+        resetAuthKeyAttempt()
         loginCompletionTask?.cancel()
         loginCompletionTask = nil
         isCompletingAppLogin = false
@@ -1332,7 +1473,14 @@ class AppState: ObservableObject {
             return
         }
 
+        let wasAuthKeyLogin = isAuthKeyLogin
         invalidateActiveLoginAttempt()
+        if wasAuthKeyLogin {
+            clearBackendSnapshotState()
+            ipnState = .needsLogin
+            clearSharedLoginState()
+            sharedDefaults?.set(message, forKey: IPCConstants.keyLastError)
+        }
         loginCompletionPollTask?.cancel()
         loginCompletionPollTask = nil
         isLoggingIn = false
@@ -1407,6 +1555,7 @@ class AppState: ObservableObject {
         loginCompletionPollTask?.cancel()
         loginCompletionPollTask = nil
         isCompletingAppLogin = true
+        let completionAttemptID = activeLoginAttemptID
         loginCompletionTask = Task {
             defer {
                 if !Task.isCancelled {
@@ -1415,21 +1564,29 @@ class AppState: ObservableObject {
                 }
             }
             let backendState = await loginBackendState()
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, activeLoginAttemptID == completionAttemptID else { return }
             if backendState == .needsMachineAuth && canShowMachineAuthDuringLogin {
                 showMachineAuthPending()
                 isCompletingAppLogin = false
-                startLoginCompletionPolling()
+                if !isAuthKeyLogin { startLoginCompletionPolling() }
                 return
             }
 
-            await fetchCurrentProfileFromLoginBackend()
+            if isAuthKeyLogin {
+                guard authKeyCompletionStateIsValid(backendState),
+                      let profile = try? await LocalAPIClient.login(loginBackend).currentProfile(),
+                      !profile.ID.isEmpty, profile.UserProfile?.ID != nil,
+                      !Task.isCancelled, activeLoginAttemptID == completionAttemptID else { return }
+                currentProfile = profile
+            } else {
+                await fetchCurrentProfileFromLoginBackend()
+            }
             guard !Task.isCancelled else { return }
             var finalBackendState = backendState
             if finalBackendState == nil {
                 finalBackendState = await loginBackendState()
             }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, activeLoginAttemptID == completionAttemptID else { return }
             if let finalBackendState = finalBackendState {
                 ipnState = finalBackendState
             }
@@ -1443,6 +1600,7 @@ class AppState: ObservableObject {
             activeLoginAttemptID = nil
             activeLoginControlServerURL = nil
             loginStartTask = nil
+            resetAuthKeyAttempt()
             isCompletingAppLogin = false
         }
     }
@@ -1630,6 +1788,10 @@ class AppState: ObservableObject {
     }
 
     func refreshMachineAuthStatus() async -> Bool {
+        if isAuthKeyLogin, let attempt = activeLoginAttemptID {
+            await checkAuthKeyResult(loginAttemptID: attempt)
+            return activeLoginAttemptID != attempt && !isAwaitingMachineAuth
+        }
         if loginBackend.isRunning {
             guard let backendState = await loginBackendState() else { return false }
             ipnState = backendState

@@ -2,6 +2,13 @@ import XCTest
 @testable import AwgScale
 
 final class ModelsTests: XCTestCase {
+    func testLoginErrorNotificationIsOptionalAndDecodes() throws {
+        let failure = try JSONDecoder().decode(IpnNotify.self, from: Data(#"{"ErrMessage":"registration failed"}"#.utf8))
+        XCTAssertEqual(failure.ErrMessage, "registration failed")
+        let initial = try JSONDecoder().decode(IpnNotify.self, from: Data(#"{"State":1}"#.utf8))
+        XCTAssertNil(initial.ErrMessage)
+    }
+
 
     @MainActor
     func testEmbeddedCoreVersionMatchesRelease() {
