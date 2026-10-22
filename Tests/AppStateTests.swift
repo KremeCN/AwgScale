@@ -250,10 +250,10 @@ final class AppStateTests: XCTestCase {
         h.backend.stop()
     }
 
-    func testAuthKeyApprovalLossReturnsToLogin() async {
+    func testAuthKeyApprovalLossReturnsToLoginAfterRecoveryTimeout() async {
         let h = AuthKeyHarness()
         h.onStart = { h.backendState = "NeedsMachineAuth" }
-        let state = AppState(loginBackend: h.backend, authKeyPollInterval: 1_000_000)
+        let state = AppState(loginBackend: h.backend, authKeyLoginTimeout: 0.2, authKeyPollInterval: 1_000_000)
         state.startAuthKeyLogin(authKey: "key")
         await waitUntil { state.isAwaitingMachineAuth }
         h.backendState = "NeedsLogin"
@@ -262,6 +262,20 @@ final class AppStateTests: XCTestCase {
         XCTAssertTrue(state.shouldShowLoginView)
         state.loadSharedState()
         XCTAssertNotNil(state.lastError)
+    }
+
+    func testGoNeedsLoginNotificationDoesNotEnterMachineAuth() async {
+        let h = AuthKeyHarness()
+        h.onStart = { h.backendState = "NeedsLogin" }
+        let state = AppState(loginBackend: h.backend, authKeyPollInterval: 1_000_000)
+        state.startAuthKeyLogin(authKey: "key")
+        await waitUntil { h.wantRunning }
+        h.emit(#"{"State":2}"#)
+        await Task.yield()
+        XCTAssertFalse(state.isAwaitingMachineAuth)
+        XCTAssertEqual(state.ipnState, .needsLogin)
+        state.cancelLogin()
+        await waitUntil { !state.isLoggingOut }
     }
 
     func testBrowserLoginStillUsesInteractiveEndpoint() async {
@@ -465,7 +479,7 @@ final class AppStateTests: XCTestCase {
         let state = AppState()
 
         let json = """
-        {"State": 5}
+        {"State": 6}
         """.data(using: .utf8)!
 
         state.handleNotify(json)
@@ -551,7 +565,7 @@ final class AppStateTests: XCTestCase {
         state.health = HealthState(Warnings: [:])
 
         let json = """
-        {"State": 1}
+        {"State": 2}
         """.data(using: .utf8)!
 
         state.handleNotify(json)
@@ -647,7 +661,7 @@ final class AppStateTests: XCTestCase {
         state.pendingWantRunning = true
 
         let json = """
-        {"State": 1}
+        {"State": 2}
         """.data(using: .utf8)!
 
         state.handleNotify(json)
@@ -676,7 +690,7 @@ final class AppStateTests: XCTestCase {
         state.awgSyncInProgress = "server"
 
         let json = """
-        {"State": 1}
+        {"State": 2}
         """.data(using: .utf8)!
 
         state.handleNotify(json)
@@ -697,7 +711,7 @@ final class AppStateTests: XCTestCase {
         state.isUpdatingExitNode = true
 
         let json = """
-        {"State": 1}
+        {"State": 2}
         """.data(using: .utf8)!
 
         state.handleNotify(json)
@@ -718,7 +732,7 @@ final class AppStateTests: XCTestCase {
         state.isSwitchingNetworkMode = true
 
         let json = """
-        {"State": 1}
+        {"State": 2}
         """.data(using: .utf8)!
 
         state.handleNotify(json)

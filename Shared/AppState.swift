@@ -179,6 +179,7 @@ private extension IpnState {
     init?(backendState: String) {
         switch backendState {
         case "NoState": self = .noState
+        case "InUseOtherUser": self = .inUseOtherUser
         case "NeedsLogin": self = .needsLogin
         case "NeedsMachineAuth": self = .needsMachineAuth
         case "Stopped": self = .stopped
@@ -1231,7 +1232,7 @@ class AppState: ObservableObject {
 
         ipnState = backendState
         switch backendState {
-        case .needsLogin, .noState:
+        case .needsLogin, .noState, .inUseOtherUser:
             if tolerateStartupTransient { return }
             loginBackend.stop()
             throw LoginFlowError.localAPI("No active backend")
@@ -1437,8 +1438,8 @@ class AppState: ObservableObject {
         guard isActiveLoginAttempt(loginAttemptID), authKeyRequestAccepted else { return }
         let state = await loginBackendState()
         guard isActiveLoginAttempt(loginAttemptID) else { return }
-        if isAwaitingMachineAuth, state == .needsLogin || state == .noState {
-            failActiveLogin("Device authorization is no longer valid. Sign in again.", loginAttemptID: loginAttemptID)
+        if state == .inUseOtherUser {
+            failActiveLogin("The local backend is in use by another user. Stop the other session and retry.", loginAttemptID: loginAttemptID)
             return
         }
         if state == .needsMachineAuth {
@@ -1648,7 +1649,7 @@ class AppState: ObservableObject {
             ipnState = backendState
 
             switch backendState {
-            case .needsLogin, .noState:
+            case .needsLogin, .noState, .inUseOtherUser:
                 if coldStart, await restoreProfileOnlyFromLoginBackend() {
                     ipnState = .stopped
                 } else {
@@ -1764,7 +1765,7 @@ class AppState: ObservableObject {
         guard let backendState = await loginBackendState() else { return false }
 
         switch backendState {
-        case .needsLogin, .noState, .needsMachineAuth:
+        case .needsLogin, .noState, .needsMachineAuth, .inUseOtherUser:
             return false
         default:
             return true
@@ -1805,7 +1806,7 @@ class AppState: ObservableObject {
             case .needsMachineAuth:
                 showMachineAuthPending()
                 return false
-            case .needsLogin, .noState:
+            case .needsLogin, .noState, .inUseOtherUser:
                 return false
             default:
                 isLoggingIn = false

@@ -42,11 +42,12 @@ final class ModelsTests: XCTestCase {
 
     func testIpnStateFromRawValue() {
         XCTAssertEqual(IpnState(rawValue: 0), .noState)
-        XCTAssertEqual(IpnState(rawValue: 1), .needsLogin)
-        XCTAssertEqual(IpnState(rawValue: 2), .needsMachineAuth)
-        XCTAssertEqual(IpnState(rawValue: 3), .stopped)
-        XCTAssertEqual(IpnState(rawValue: 4), .starting)
-        XCTAssertEqual(IpnState(rawValue: 5), .running)
+        XCTAssertEqual(IpnState(rawValue: 1), .inUseOtherUser)
+        XCTAssertEqual(IpnState(rawValue: 2), .needsLogin)
+        XCTAssertEqual(IpnState(rawValue: 3), .needsMachineAuth)
+        XCTAssertEqual(IpnState(rawValue: 4), .stopped)
+        XCTAssertEqual(IpnState(rawValue: 5), .starting)
+        XCTAssertEqual(IpnState(rawValue: 6), .running)
         XCTAssertNil(IpnState(rawValue: 99))
     }
 

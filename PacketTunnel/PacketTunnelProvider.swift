@@ -60,7 +60,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         resetTunnelLifecycleState()
         sharedDefaults?.removeObject(forKey: IPCConstants.keyLastError)
         sharedDefaults?.set(false, forKey: IPCConstants.keyTunnelHasDefaultRoute)
-        writeSharedState(ipnState: 4) // IpnState.starting
+        writeSharedState(ipnState: IpnState.starting.rawValue)
 
         // 1. Determine data directory inside App Group container
         guard let containerURL = sharedContainerURL else {
@@ -153,7 +153,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // Write disconnected state to shared defaults
         sharedDefaults?.set(false, forKey: IPCConstants.keyTunnelHasDefaultRoute)
         sharedDefaults?.removeObject(forKey: IPCConstants.keyLastError)
-        writeSharedState(ipnState: 3) // IpnState.stopped
+        writeSharedState(ipnState: IpnState.stopped.rawValue)
 
         completionHandler()
     }

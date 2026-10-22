@@ -6,15 +6,17 @@ import Foundation
 /// Values match the Go constants exactly.
 enum IpnState: Int, Codable {
     case noState = 0
-    case needsLogin = 1
-    case needsMachineAuth = 2
-    case stopped = 3
-    case starting = 4
-    case running = 5
+    case inUseOtherUser = 1
+    case needsLogin = 2
+    case needsMachineAuth = 3
+    case stopped = 4
+    case starting = 5
+    case running = 6
 
     var displayName: String {
         switch self {
         case .noState: return "Initializing"
+        case .inUseOtherUser: return "In Use by Another User"
         case .needsLogin: return "Not Signed In"
         case .needsMachineAuth: return "Awaiting Approval"
         case .stopped: return "Disconnected"
